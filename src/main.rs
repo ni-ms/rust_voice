@@ -6,11 +6,10 @@ use std::fs;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
-use eframe::egui::{Color32, Shadow, Stroke};
+use eframe::egui::Color32;
 use hound::{self, WavReader, WavSpec};
 
 fn write_wav_file(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> {
@@ -256,7 +255,8 @@ impl eframe::App for VoiceRecorderApp {
 
                 ui.add_space(20.0);
 
-                // Recording Controls
+
+                //TODO: rounding is deprecated, need to fix it
                 egui::Frame::default()
                     .fill(Color32::from_rgb(34, 40, 35)) // #222823
                     .rounding(egui::Rounding::same(10.0 as u8))
@@ -284,7 +284,7 @@ impl eframe::App for VoiceRecorderApp {
                                     .add_sized(
                                         [120.0, 40.0],
                                         egui::Button::new("⏹ Stop")
-                                            .fill(Color32::from_rgb(87, 90, 94)), 
+                                            .fill(Color32::from_rgb(87, 90, 94)),
                                     )
                                     .clicked()
                                 {
@@ -302,7 +302,7 @@ impl eframe::App for VoiceRecorderApp {
                 );
                 ui.add_space(10.0);
 
-                // File list
+
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
@@ -364,7 +364,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Rust Voice Recorder",
+        "Voice Recorder",
         options,
         Box::new(|_cc| Ok(Box::new(VoiceRecorderApp::default()))),
     )

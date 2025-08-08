@@ -1,0 +1,9 @@
+[package]
+name = "rust_voice"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.32.0"
+cpal = "0.16.0"
+hound = "3.5.1"

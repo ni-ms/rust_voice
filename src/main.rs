@@ -8,10 +8,25 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
+use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
 use hound::{WavReader, WavSpec};
 
-fn write_wav_file(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> {
+// Enhanced write function to handle both f32 and i16
+fn write_wav_file_f32(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> {
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    for &s in samples {
+        writer
+            .write_sample(s)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(())
+}
+
+fn write_wav_file_i16(path: &str, spec: WavSpec, samples: &[i16]) -> io::Result<()> {
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     for &s in samples {
@@ -36,6 +51,7 @@ fn list_wav_files() -> Vec<String> {
             }
         }
     }
+    files.sort(); // Sort files for better organization
     files
 }
 
@@ -49,6 +65,7 @@ enum Message {
     Tick(Instant),
     Toggle,
     Reset,
+    FinalizeRecording, // New message for delayed stop
 }
 
 struct VoiceRecorder {
@@ -63,6 +80,7 @@ struct VoiceRecorder {
     playback_status_rx: mpsc::Receiver<()>,
     start_time: Option<Instant>,
     elapsed_time: Duration,
+    stopping_time: Option<Instant>, // For delayed stop
 }
 
 impl Default for VoiceRecorder {
@@ -80,6 +98,7 @@ impl Default for VoiceRecorder {
             playback_status_rx: rx,
             start_time: None,
             elapsed_time: Duration::from_secs(0),
+            stopping_time: None,
         }
     }
 }
@@ -109,7 +128,32 @@ impl VoiceRecorder {
             }
         };
 
-        let config: StreamConfig = default_config.clone().into();
+        // Prefer higher quality settings
+        let preferred_sample_rate = cpal::SampleRate(48000); // Standard CD quality
+        let config = if default_config.sample_rate() <= preferred_sample_rate
+            && preferred_sample_rate <= default_config.sample_rate()
+        {
+            StreamConfig {
+                channels: default_config.channels(),
+                sample_rate: preferred_sample_rate,
+                buffer_size: BufferSize::Fixed(1024), // Larger buffer = less dropouts
+            }
+        } else {
+            StreamConfig {
+                channels: default_config.channels(),
+                sample_rate: default_config.sample_rate(),
+                buffer_size: BufferSize::Fixed(1024),
+            }
+        };
+
+        // Add debug info
+        println!(
+            "Recording with: channels={}, sample_rate={}, format={:?}",
+            config.channels,
+            config.sample_rate.0,
+            default_config.sample_format()
+        );
+
         let audio_buf = Arc::clone(&self.audio_data);
 
         let build_result = match default_config.sample_format() {
@@ -156,7 +200,7 @@ impl VoiceRecorder {
                 )
             }
             _ => {
-                self.status_message = "Unsupported sample format".into();
+                self.status_message = "Unsupported input sample format".into();
                 return;
             }
         };
@@ -172,6 +216,7 @@ impl VoiceRecorder {
                 self.status_message = "Recording...".into();
                 self.start_time = Some(Instant::now());
                 self.elapsed_time = Duration::from_secs(0);
+                self.stopping_time = None;
             }
             Err(e) => {
                 self.status_message = format!("Failed to build input stream: {}", e);
@@ -184,9 +229,17 @@ impl VoiceRecorder {
             return;
         }
 
-        self.input_stream = None;
+        // Don't immediately drop the stream - mark for stopping
         self.is_recording = false;
         self.start_time = None;
+        self.stopping_time = Some(Instant::now());
+        self.status_message = "Stopping recording...".into();
+    }
+
+    fn finalize_recording(&mut self) {
+        // Now actually drop the stream and save the file
+        self.input_stream = None;
+        self.stopping_time = None;
 
         let filename = format!("recording_{}.wav", self.files.len() + 1);
         let samples: Vec<f32> = std::mem::take(&mut *self.audio_data.lock().unwrap());
@@ -195,6 +248,12 @@ impl VoiceRecorder {
             self.status_message = "Error saving file: No audio data captured".into();
             return;
         }
+
+        // Convert to 16-bit for better compatibility and smaller files
+        let samples_i16: Vec<i16> = samples
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect();
 
         let host = cpal::default_host();
         let device = match host.default_input_device() {
@@ -212,16 +271,17 @@ impl VoiceRecorder {
             }
         };
 
+        // Use 16-bit format for better compatibility
         let spec = WavSpec {
             channels: config.channels() as u16,
-            sample_rate: config.sample_rate().0,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
+            sample_rate: 48000,                      // Use standard sample rate
+            bits_per_sample: 16,                     // Changed from 32
+            sample_format: hound::SampleFormat::Int, // Changed from Float
         };
 
-        match write_wav_file(&filename, spec, &samples) {
+        match write_wav_file_i16(&filename, spec, &samples_i16) {
             Ok(()) => {
-                self.status_message = format!("Recording stopped. File saved as '{}'", filename);
+                self.status_message = format!("Recording saved as '{}'", filename);
                 self.files = list_wav_files();
             }
             Err(e) => {
@@ -237,7 +297,7 @@ impl VoiceRecorder {
 
         self.stop_playback_impl();
 
-        let reader = match WavReader::open(filename) {
+        let mut reader = match WavReader::open(filename) {
             Ok(r) => r,
             Err(e) => {
                 self.status_message = format!("Error opening file: {}", e);
@@ -246,14 +306,66 @@ impl VoiceRecorder {
         };
 
         let spec = reader.spec();
-        let samples_res: Result<Vec<f32>, _> = reader.into_samples::<f32>().collect();
-        let samples = match samples_res {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_message = format!("Error reading samples: {}", e);
-                return;
+        println!(
+            "File spec: channels={}, sample_rate={}, bits_per_sample={}",
+            spec.channels, spec.sample_rate, spec.bits_per_sample
+        );
+        let samples = match spec.sample_format {
+            hound::SampleFormat::Float => {
+                match reader
+                    .into_samples::<f32>()
+                    .collect::<Result<Vec<f32>, _>>()
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.status_message = format!("Error reading float samples: {}", e);
+                        return;
+                    }
+                }
             }
+            hound::SampleFormat::Int => match spec.bits_per_sample {
+                16 => {
+                    match reader
+                        .into_samples::<i16>()
+                        .collect::<Result<Vec<i16>, _>>()
+                    {
+                        Ok(samples_i16) => samples_i16
+                            .into_iter()
+                            .map(|s| s as f32 / i16::MAX as f32)
+                            .collect(),
+                        Err(e) => {
+                            self.status_message = format!("Error reading i16 samples: {}", e);
+                            return;
+                        }
+                    }
+                }
+                32 => {
+                    match reader
+                        .into_samples::<i32>()
+                        .collect::<Result<Vec<i32>, _>>()
+                    {
+                        Ok(samples_i32) => samples_i32
+                            .into_iter()
+                            .map(|s| s as f32 / i32::MAX as f32)
+                            .collect(),
+                        Err(e) => {
+                            self.status_message = format!("Error reading i32 samples: {}", e);
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    self.status_message =
+                        format!("Unsupported bit depth: {}", spec.bits_per_sample);
+                    return;
+                }
+            },
         };
+
+        if samples.is_empty() {
+            self.status_message = "File contains no samples.".into();
+            return;
+        }
 
         if samples.is_empty() {
             self.status_message = "File contains no samples.".into();
@@ -273,7 +385,20 @@ impl VoiceRecorder {
         };
 
         let supported_cfgs = match device.supported_output_configs() {
-            Ok(v) => v.collect::<Vec<_>>(),
+            Ok(v) => {
+                let configs: Vec<_> = v.collect();
+                println!("Supported output configs:");
+                for cfg in &configs {
+                    println!(
+                        "  Channels: {}, Sample rate range: {}-{}, Format: {:?}",
+                        cfg.channels(),
+                        cfg.min_sample_rate().0,
+                        cfg.max_sample_rate().0,
+                        cfg.sample_format()
+                    );
+                }
+                configs
+            }
             Err(e) => {
                 self.status_message = format!("Error querying output configs: {}", e);
                 return;
@@ -286,21 +411,47 @@ impl VoiceRecorder {
             .min_by_key(|c| ((c.max_sample_rate().0 as i64) - (spec.sample_rate as i64)).abs());
 
         let chosen = match matched {
-            Some(c) => c.with_sample_rate(c.max_sample_rate()),
+            Some(c) => {
+                let sample_rate = if spec.sample_rate >= c.min_sample_rate().0
+                    && spec.sample_rate <= c.max_sample_rate().0
+                {
+                    cpal::SampleRate(spec.sample_rate)
+                } else {
+                    c.max_sample_rate()
+                };
+                c.with_sample_rate(sample_rate)
+            }
             None => {
-                self.status_message =
-                    "No supported output config found matching file channels.".into();
-                return;
+                // Try to find any compatible config if exact match fails
+                let fallback = device
+                    .supported_output_configs()
+                    .ok()
+                    .and_then(|mut configs| configs.next());
+
+                match fallback {
+                    Some(c) => {
+                        self.status_message = format!(
+                            "Using fallback config (channels: {} -> {})",
+                            spec.channels,
+                            c.channels()
+                        );
+                        c.with_sample_rate(c.max_sample_rate())
+                    }
+                    None => {
+                        self.status_message = "No compatible output configuration found.".into();
+                        return;
+                    }
+                }
             }
         };
 
-        let sample_format = chosen.sample_format(); // Get this first
-        let stream_config: StreamConfig = chosen.into(); // Now move chosen
+        let sample_format = chosen.sample_format();
+        println!("Using sample format: {:?}", sample_format);
+        let stream_config: StreamConfig = chosen.into();
         let samples_for_callback = Arc::clone(&samples_arc);
         let play_tx_clone = play_tx.clone();
 
         let build_out = match sample_format {
-            // Use the extracted value
             SampleFormat::F32 => device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
@@ -310,9 +461,7 @@ impl VoiceRecorder {
                         out[..len].copy_from_slice(&buf[..len]);
                         buf.drain(..len);
                     } else {
-                        for o in out.iter_mut() {
-                            *o = 0.0;
-                        }
+                        out.fill(0.0);
                     }
                     if buf.is_empty() {
                         let _ = play_tx_clone.send(());
@@ -329,13 +478,10 @@ impl VoiceRecorder {
                         let mut buf = samples_for_callback.lock().unwrap();
                         let len = out.len().min(buf.len());
                         for i in 0..len {
-                            let s = (buf[i] * (i16::MAX as f32)) as i16;
-                            out[i] = s;
+                            out[i] = (buf[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         }
                         if len < out.len() {
-                            for i in len..out.len() {
-                                out[i] = 0;
-                            }
+                            out[len..].fill(0);
                         }
                         if buf.len() >= len {
                             buf.drain(..len);
@@ -358,14 +504,11 @@ impl VoiceRecorder {
                         let mut buf = samples_for_callback.lock().unwrap();
                         let len = out.len().min(buf.len());
                         for i in 0..len {
-                            let v = ((buf[i] * 0.5 + 0.5) * (u16::MAX as f32))
-                                .clamp(0.0, u16::MAX as f32);
+                            let v = ((buf[i].clamp(-1.0, 1.0) + 1.0) * 0.5 * u16::MAX as f32);
                             out[i] = v as u16;
                         }
                         if len < out.len() {
-                            for i in len..out.len() {
-                                out[i] = u16::MAX / 2;
-                            }
+                            out[len..].fill(u16::MAX / 2);
                         }
                         if buf.len() >= len {
                             buf.drain(..len);
@@ -388,22 +531,21 @@ impl VoiceRecorder {
                         let mut buf = samples_for_callback.lock().unwrap();
                         let len = out.len().min(buf.len());
                         for i in 0..len {
-                            // Convert f32 (-1.0..1.0) to u8 (0..255)
-                            // 128 = silence, <128 = negative, >128 = positive
-                            let v = ((buf[i] + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
-                            out[i] = v as u8;
+                            // Improved conversion with better scaling and simple dithering
+                            let sample = buf[i].clamp(-1.0, 1.0);
+                            let scaled = (sample + 1.0) * 127.5;
+                            // Simple dithering using golden ratio noise
+                            let dithered = scaled + ((i as f32 * 0.618033988749) % 1.0 - 0.5);
+                            out[i] = dithered.clamp(0.0, 255.0) as u8;
                         }
-                        // Fill remaining with silence (128 for U8)
                         if len < out.len() {
-                            out[len..].fill(128);
+                            out[len..].fill(128); // 128 = silence for U8
                         }
-                        // Remove processed samples
                         if buf.len() >= len {
                             buf.drain(..len);
                         } else {
                             buf.clear();
                         }
-                        // Signal playback finished
                         if buf.is_empty() {
                             let _ = play_tx_clone.send(());
                         }
@@ -466,11 +608,20 @@ impl VoiceRecorder {
             Message::PlayFile(fname) => self.play_file_impl(&fname),
             Message::StopPlayback => self.stop_playback_impl(),
             Message::DeleteFile(fname) => self.delete_file_impl(&fname),
+            Message::FinalizeRecording => self.finalize_recording(),
             Message::Tick(now) => {
                 if let Some(start) = self.start_time {
                     self.elapsed_time = now - start;
                 }
 
+                // Handle delayed recording stop
+                if let Some(stop_time) = self.stopping_time {
+                    if now.duration_since(stop_time) >= Duration::from_millis(200) {
+                        return Task::perform(async {}, |_| Message::FinalizeRecording);
+                    }
+                }
+
+                // Check for playback finished
                 if self.playback_status_rx.try_recv().is_ok() {
                     self.stop_playback_impl();
                     self.status_message = "Playback finished.".into();
@@ -489,7 +640,7 @@ impl VoiceRecorder {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let tick = if self.is_recording || self.is_playing {
+        let tick = if self.is_recording || self.is_playing || self.stopping_time.is_some() {
             time::every(Duration::from_millis(16)).map(Message::Tick)
         } else {
             Subscription::none()
@@ -509,18 +660,20 @@ impl VoiceRecorder {
         let cs = (self.elapsed_time.subsec_millis() / 10) as u64;
         let formatted = format!("{:02}:{:02}.{:02}", secs / 60, secs % 60, cs);
 
-        let timer_text = text(formatted).size(40); // Remove & here - pass owned String
+        let timer_text = text(formatted).size(40);
 
-        let record_button = if !self.is_recording && !self.is_playing {
-            button(text("⏺ Record")).on_press(Message::StartRecording)
-        } else {
-            button(text("⏹ Stop")).on_press(Message::StopRecording)
-        };
+        // Use ASCII alternatives for better compatibility
+        let record_button =
+            if !self.is_recording && !self.is_playing && self.stopping_time.is_none() {
+                button(text("● Record")).on_press(Message::StartRecording)
+            } else {
+                button(text("■ Stop")).on_press(Message::StopRecording)
+            };
 
         let stop_playback_button = if self.is_playing {
-            button(text("◼ Stop Playback")).on_press(Message::StopPlayback)
+            button(text("■ Stop Playback")).on_press(Message::StopPlayback)
         } else {
-            button(text("◼ Stop Playback"))
+            button(text("■ Stop Playback"))
         };
 
         let files_content = if self.files.is_empty() {
@@ -529,9 +682,9 @@ impl VoiceRecorder {
             let mut files_col = column![];
             for file_name in &self.files {
                 let row = row![
-                    text(file_name), // Use reference to self.files data
-                    button(text("▶ Play")).on_press(Message::PlayFile(file_name.clone())),
-                    button(text("❌ Delete")).on_press(Message::DeleteFile(file_name.clone())),
+                    text(file_name).width(Length::Fill),
+                    button(text("► Play")).on_press(Message::PlayFile(file_name.clone())),
+                    button(text("✕ Delete")).on_press(Message::DeleteFile(file_name.clone())),
                 ]
                 .spacing(12);
                 files_col = files_col.push(row);
@@ -543,7 +696,7 @@ impl VoiceRecorder {
 
         let content = column![
             text("Voice Recorder").size(30),
-            text(&self.status_message).size(16), // Reference to self field is OK
+            text(&self.status_message).size(16),
             timer_text,
             row![record_button, stop_playback_button].spacing(12),
             text("Recorded Files").size(22),

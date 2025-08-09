@@ -11,7 +11,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
 use hound::{WavReader, WavSpec};
 
-// Enhanced write function to handle both f32 and i16
 fn write_wav_file_f32(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> {
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -51,7 +50,7 @@ fn list_wav_files() -> Vec<String> {
             }
         }
     }
-    files.sort(); // Sort files for better organization
+    files.sort();
     files
 }
 
@@ -65,7 +64,7 @@ enum Message {
     Tick(Instant),
     Toggle,
     Reset,
-    FinalizeRecording, // New message for delayed stop
+    FinalizeRecording,
 }
 
 struct VoiceRecorder {
@@ -80,7 +79,9 @@ struct VoiceRecorder {
     playback_status_rx: mpsc::Receiver<()>,
     start_time: Option<Instant>,
     elapsed_time: Duration,
-    stopping_time: Option<Instant>, // For delayed stop
+    stopping_time: Option<Instant>,
+    recording_sample_rate: u32, // NEW: Track actual recording sample rate
+    recording_channels: u16,    // NEW: Track actual recording channels
 }
 
 impl Default for VoiceRecorder {
@@ -99,6 +100,8 @@ impl Default for VoiceRecorder {
             start_time: None,
             elapsed_time: Duration::from_secs(0),
             stopping_time: None,
+            recording_sample_rate: 48000, // NEW: Default sample rate
+            recording_channels: 1,        // NEW: Default channels
         }
     }
 }
@@ -128,15 +131,14 @@ impl VoiceRecorder {
             }
         };
 
-        // Prefer higher quality settings
-        let preferred_sample_rate = cpal::SampleRate(48000); // Standard CD quality
+        let preferred_sample_rate = cpal::SampleRate(48000);
         let config = if default_config.sample_rate() <= preferred_sample_rate
             && preferred_sample_rate <= default_config.sample_rate()
         {
             StreamConfig {
                 channels: default_config.channels(),
                 sample_rate: preferred_sample_rate,
-                buffer_size: BufferSize::Fixed(1024), // Larger buffer = less dropouts
+                buffer_size: BufferSize::Fixed(1024),
             }
         } else {
             StreamConfig {
@@ -146,7 +148,10 @@ impl VoiceRecorder {
             }
         };
 
-        // Add debug info
+        // NEW: Store the actual recording configuration
+        self.recording_sample_rate = config.sample_rate.0;
+        self.recording_channels = config.channels as u16;
+
         println!(
             "Recording with: channels={}, sample_rate={}, format={:?}",
             config.channels,
@@ -229,7 +234,6 @@ impl VoiceRecorder {
             return;
         }
 
-        // Don't immediately drop the stream - mark for stopping
         self.is_recording = false;
         self.start_time = None;
         self.stopping_time = Some(Instant::now());
@@ -237,7 +241,6 @@ impl VoiceRecorder {
     }
 
     fn finalize_recording(&mut self) {
-        // Now actually drop the stream and save the file
         self.input_stream = None;
         self.stopping_time = None;
 
@@ -249,37 +252,19 @@ impl VoiceRecorder {
             return;
         }
 
-        // Convert to 16-bit for better compatibility and smaller files
-        let samples_i16: Vec<i16> = samples
-            .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .collect();
-
-        let host = cpal::default_host();
-        let device = match host.default_input_device() {
-            Some(d) => d,
-            None => {
-                self.status_message = "Failed to find default input device".into();
-                return;
-            }
-        };
-        let config = match device.default_input_config() {
-            Ok(conf) => conf,
-            Err(e) => {
-                self.status_message = format!("Failed to get default input config: {}", e);
-                return;
-            }
-        };
-
-        // Use 16-bit format for better compatibility
         let spec = WavSpec {
-            channels: config.channels() as u16,
-            sample_rate: 48000,                      // Use standard sample rate
-            bits_per_sample: 16,                     // Changed from 32
-            sample_format: hound::SampleFormat::Int, // Changed from Float
+            channels: self.recording_channels,
+            sample_rate: self.recording_sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
         };
 
-        match write_wav_file_i16(&filename, spec, &samples_i16) {
+        println!(
+            "Saving WAV file with: channels={}, sample_rate={}, bits_per_sample={}, format=F32",
+            spec.channels, spec.sample_rate, spec.bits_per_sample
+        );
+
+        match write_wav_file_f32(&filename, spec, &samples) {
             Ok(()) => {
                 self.status_message = format!("Recording saved as '{}'", filename);
                 self.files = list_wav_files();
@@ -297,7 +282,7 @@ impl VoiceRecorder {
 
         self.stop_playback_impl();
 
-        let mut reader = match WavReader::open(filename) {
+        let reader = match WavReader::open(filename) {
             Ok(r) => r,
             Err(e) => {
                 self.status_message = format!("Error opening file: {}", e);
@@ -367,11 +352,6 @@ impl VoiceRecorder {
             return;
         }
 
-        if samples.is_empty() {
-            self.status_message = "File contains no samples.".into();
-            return;
-        }
-
         let samples_arc = Arc::new(Mutex::new(samples));
         let play_tx = self.playback_status_tx.clone();
 
@@ -408,7 +388,18 @@ impl VoiceRecorder {
         let matched = supported_cfgs
             .into_iter()
             .filter(|c| c.channels() == spec.channels as u16)
-            .min_by_key(|c| ((c.max_sample_rate().0 as i64) - (spec.sample_rate as i64)).abs());
+            .min_by_key(|c| {
+                let format_priority = match c.sample_format() {
+                    SampleFormat::F32 => 0,  // Best match - same as file
+                    SampleFormat::I16 => 1,  // Good quality
+                    SampleFormat::I32 => 2,
+                    SampleFormat::U16 => 3,
+                    SampleFormat::U8 => 100,
+                    _ => 50,
+                };
+                let rate_diff = ((c.max_sample_rate().0 as i64) - (spec.sample_rate as i64)).abs();
+                (format_priority, rate_diff)
+            });
 
         let chosen = match matched {
             Some(c) => {
@@ -422,7 +413,6 @@ impl VoiceRecorder {
                 c.with_sample_rate(sample_rate)
             }
             None => {
-                // Try to find any compatible config if exact match fails
                 let fallback = device
                     .supported_output_configs()
                     .ok()
@@ -446,8 +436,23 @@ impl VoiceRecorder {
         };
 
         let sample_format = chosen.sample_format();
-        println!("Using sample format: {:?}", sample_format);
         let stream_config: StreamConfig = chosen.into();
+
+        println!(
+            "File sample rate: {}, Device will use: {}",
+            spec.sample_rate, stream_config.sample_rate.0
+        );
+
+        if spec.sample_rate != stream_config.sample_rate.0 {
+            println!("WARNING: Sample rate mismatch detected! This may cause pitch issues.");
+            self.status_message = format!(
+                "Sample rate mismatch: file={}Hz, device={}Hz",
+                spec.sample_rate, stream_config.sample_rate.0
+            );
+        }
+
+        println!("Using sample format: {:?}", sample_format);
+
         let samples_for_callback = Arc::clone(&samples_arc);
         let play_tx_clone = play_tx.clone();
 
@@ -460,6 +465,10 @@ impl VoiceRecorder {
                     if len > 0 {
                         out[..len].copy_from_slice(&buf[..len]);
                         buf.drain(..len);
+
+                        if len < out.len() {
+                            out[len..].fill(0.0);
+                        }
                     } else {
                         out.fill(0.0);
                     }
@@ -531,15 +540,14 @@ impl VoiceRecorder {
                         let mut buf = samples_for_callback.lock().unwrap();
                         let len = out.len().min(buf.len());
                         for i in 0..len {
-                            // Improved conversion with better scaling and simple dithering
                             let sample = buf[i].clamp(-1.0, 1.0);
                             let scaled = (sample + 1.0) * 127.5;
-                            // Simple dithering using golden ratio noise
+
                             let dithered = scaled + ((i as f32 * 0.618033988749) % 1.0 - 0.5);
                             out[i] = dithered.clamp(0.0, 255.0) as u8;
                         }
                         if len < out.len() {
-                            out[len..].fill(128); // 128 = silence for U8
+                            out[len..].fill(128);
                         }
                         if buf.len() >= len {
                             buf.drain(..len);
@@ -614,14 +622,12 @@ impl VoiceRecorder {
                     self.elapsed_time = now - start;
                 }
 
-                // Handle delayed recording stop
                 if let Some(stop_time) = self.stopping_time {
                     if now.duration_since(stop_time) >= Duration::from_millis(200) {
                         return Task::perform(async {}, |_| Message::FinalizeRecording);
                     }
                 }
 
-                // Check for playback finished
                 if self.playback_status_rx.try_recv().is_ok() {
                     self.stop_playback_impl();
                     self.status_message = "Playback finished.".into();
@@ -662,7 +668,6 @@ impl VoiceRecorder {
 
         let timer_text = text(formatted).size(40);
 
-        // Use ASCII alternatives for better compatibility
         let record_button =
             if !self.is_recording && !self.is_playing && self.stopping_time.is_none() {
                 button(text("● Record")).on_press(Message::StartRecording)

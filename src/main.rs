@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use iced::keyboard::{self, Key};
 use iced::widget::{button, center, column, row, scrollable, text};
 use iced::{Element, Length, Subscription, Task, Theme, time};

@@ -30,8 +30,15 @@ jobs:
     - name: Build for Windows (Release)
       run: cargo build --release --target x86_64-pc-windows-gnu --verbose
 
-    - name: Upload Windows Release Binary
+    - name: Add README and zip
+      run: |
+        mkdir -p dist
+        echo "This is a Rust-based voice recorder tool using CPAL and EGUI." > dist/README.txt
+        cp target/x86_64-pc-windows-gnu/release/rust_voice.exe dist/rust_voice.exe
+        zip -r rust_voice_windows.zip dist/
+
+    - name: Upload zipped binary
       uses: actions/upload-artifact@v4
       with:
-        name: rust_voice_windows
-        path: target/x86_64-pc-windows-gnu/release/rust_voice.exe
+        name: rust_voice_windows_zip
+        path: rust_voice_windows.zip

@@ -255,11 +255,9 @@ impl eframe::App for VoiceRecorderApp {
 
                 ui.add_space(20.0);
 
-
-                //TODO: rounding is deprecated, need to fix it
                 egui::Frame::default()
                     .fill(Color32::from_rgb(34, 40, 35)) // #222823
-                    .rounding(egui::Rounding::same(10.0 as u8))
+                    .corner_radius(egui::CornerRadius::same(10.0 as u8))
                     .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94))) // #575A5E
                     .inner_margin(egui::Margin::same(16.0 as i8))
                     .show(ui, |ui| {
@@ -302,7 +300,6 @@ impl eframe::App for VoiceRecorderApp {
                 );
                 ui.add_space(10.0);
 
-
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
@@ -317,7 +314,7 @@ impl eframe::App for VoiceRecorderApp {
                             for file_name in &self.files {
                                 egui::Frame::default()
                                     .fill(Color32::from_rgb(34, 40, 35)) // #222823
-                                    .rounding(egui::Rounding::same(8.0 as u8))
+                                    .corner_radius(egui::CornerRadius::same(8.0 as u8))
                                     .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94))) // #575A5E
                                     .inner_margin(egui::Margin::same(12.0 as i8))
                                     .show(ui, |ui| {

@@ -6,7 +6,6 @@ use std::fs;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};

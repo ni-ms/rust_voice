@@ -7,3 +7,11 @@ edition = "2024"
 eframe = "0.32.0"
 cpal = "0.16.0"
 hound = "3.5.1"
+
+[profile.release]
+opt-level = "s"  # Optimize for size. Can also use "z" for even smaller.
+lto = true       # Enable Link Time Optimization.
+codegen-units = 1 # Reduces parallelization but allows for more aggressive optimizations.
+panic = "abort"  # Reduces binary size by removing unwinding code.
+[target.'cfg(windows)'.wants]
+windows_subsystem = "windows"

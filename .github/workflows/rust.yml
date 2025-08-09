@@ -1,8 +1,9 @@
-name: Rust
+name: Rust Windows Build & Release
 
 on:
   push:
     branches: [ "master" ]
+    tags: [ "v*" ]  # Triggers on version tags like v1.0.0
   pull_request:
     branches: [ "master" ]
   workflow_dispatch:
@@ -12,7 +13,6 @@ env:
 
 jobs:
   build-windows:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -37,8 +37,16 @@ jobs:
         cp target/x86_64-pc-windows-gnu/release/rust_voice.exe dist/rust_voice.exe
         zip -r rust_voice_windows.zip dist/
 
-    - name: Upload zipped binary
+    - name: Upload zipped binary to Actions
       uses: actions/upload-artifact@v4
       with:
         name: rust_voice_windows_zip
         path: rust_voice_windows.zip
+
+    - name: Upload to GitHub Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: rust_voice_windows.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

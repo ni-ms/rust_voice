@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
@@ -28,22 +29,30 @@ fn write_wav_file(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> 
 
 struct VoiceRecorderApp {
     is_recording: Arc<Mutex<bool>>,
+    is_playing: Arc<Mutex<bool>>,
     audio_data: Arc<Mutex<Vec<f32>>>,
     status_message: String,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
     files: Vec<String>,
+    // Add a channel to communicate playback status
+    playback_status_rx: mpsc::Receiver<()>,
+    playback_status_tx: mpsc::Sender<()>,
 }
 
 impl Default for VoiceRecorderApp {
     fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
         let mut app = Self {
             is_recording: Arc::new(Mutex::new(false)),
+            is_playing: Arc::new(Mutex::new(false)),
             audio_data: Arc::new(Mutex::new(Vec::new())),
             status_message: "Ready to record.".to_string(),
             input_stream: None,
             output_stream: None,
             files: Vec::new(),
+            playback_status_tx: tx,
+            playback_status_rx: rx,
         };
 
         app.update_file_list();
@@ -158,7 +167,11 @@ impl VoiceRecorderApp {
     }
 
     fn play_file(&mut self, filename: &str) {
-        self.output_stream = None;
+        if *self.is_playing.lock().unwrap() {
+            return;
+        }
+
+        self.stop_playback();
 
         let mut reader = match WavReader::open(filename) {
             Ok(r) => r,
@@ -171,6 +184,7 @@ impl VoiceRecorderApp {
         let spec = reader.spec();
         let samples: Vec<f32> = reader.samples().filter_map(Result::ok).collect();
         let samples_arc = Arc::new(Mutex::new(samples));
+        let playback_status_tx = self.playback_status_tx.clone();
 
         let host = cpal::default_host();
         let device = host
@@ -190,7 +204,6 @@ impl VoiceRecorderApp {
             .with_sample_rate(supported_config.max_sample_rate())
             .into();
 
-        let (tx, rx) = mpsc::channel();
         let samples_callback = Arc::clone(&samples_arc);
 
         let stream = device
@@ -203,7 +216,7 @@ impl VoiceRecorderApp {
                     samples_lock.drain(..len);
 
                     if samples_lock.is_empty() {
-                        let _ = tx.send(());
+                        let _ = playback_status_tx.send(());
                     }
                 },
                 |err| eprintln!("An error occurred on the audio stream: {}", err),
@@ -213,17 +226,39 @@ impl VoiceRecorderApp {
 
         stream.play().unwrap();
         self.output_stream = Some(stream);
+        *self.is_playing.lock().unwrap() = true;
         self.status_message = format!("Playing: {}", filename);
+    }
 
-        let _ = rx.recv();
-        self.output_stream = None;
-        self.status_message = "Playback finished.".to_string();
+    fn stop_playback(&mut self) {
+        if *self.is_playing.lock().unwrap() {
+            // Dropping the `output_stream` will stop the playback.
+            self.output_stream = None;
+            *self.is_playing.lock().unwrap() = false;
+            self.status_message = "Playback stopped.".to_string();
+        }
+    }
+
+    fn delete_file(&mut self, filename: &str) {
+        if let Err(e) = fs::remove_file(filename) {
+            self.status_message = format!("Error deleting file: {}", e);
+        } else {
+            self.status_message = format!("Deleted file: {}", filename);
+            self.update_file_list();
+        }
     }
 }
 
 impl eframe::App for VoiceRecorderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+
+        // Check for playback finished signal
+        if self.playback_status_rx.try_recv().is_ok() {
+            // Clean up the stream and update the state
+            self.stop_playback();
+            self.status_message = "Playback finished.".to_string();
+        }
 
         let visuals = egui::Visuals {
             dark_mode: true,
@@ -256,20 +291,21 @@ impl eframe::App for VoiceRecorderApp {
                 ui.add_space(20.0);
 
                 egui::Frame::default()
-                    .fill(Color32::from_rgb(34, 40, 35)) // #222823
+                    .fill(Color32::from_rgb(34, 40, 35))
                     .corner_radius(egui::CornerRadius::same(10.0 as u8))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94))) // #575A5E
+                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94)))
                     .inner_margin(egui::Margin::same(16.0 as i8))
                     .show(ui, |ui| {
                         let is_recording = *self.is_recording.lock().unwrap();
+                        let is_playing = *self.is_playing.lock().unwrap();
 
                         ui.horizontal(|ui| {
-                            ui.add_enabled_ui(!is_recording, |ui| {
+                            ui.add_enabled_ui(!is_recording && !is_playing, |ui| {
                                 if ui
                                     .add_sized(
                                         [120.0, 40.0],
                                         egui::Button::new("⏺ Record")
-                                            .fill(Color32::from_rgb(220, 20, 60)), // Crimson touch
+                                            .fill(Color32::from_rgb(220, 20, 60)),
                                     )
                                     .clicked()
                                 {
@@ -289,6 +325,19 @@ impl eframe::App for VoiceRecorderApp {
                                     self.stop_recording();
                                 }
                             });
+
+                            ui.add_enabled_ui(is_playing, |ui| {
+                                if ui
+                                    .add_sized(
+                                        [120.0, 40.0],
+                                        egui::Button::new("◼ Stop Playback")
+                                            .fill(Color32::from_rgb(255, 140, 0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.stop_playback();
+                                }
+                            });
                         });
                     });
 
@@ -304,18 +353,19 @@ impl eframe::App for VoiceRecorderApp {
                     .max_height(240.0)
                     .show(ui, |ui| {
                         let mut file_to_play: Option<String> = None;
+                        let mut file_to_delete: Option<String> = None;
 
                         if self.files.is_empty() {
                             ui.label(
                                 egui::RichText::new("No recordings found.")
-                                    .color(Color32::from_rgb(167, 162, 169)), // #A7A2A9
+                                    .color(Color32::from_rgb(167, 162, 169)),
                             );
                         } else {
                             for file_name in &self.files {
                                 egui::Frame::default()
-                                    .fill(Color32::from_rgb(34, 40, 35)) // #222823
+                                    .fill(Color32::from_rgb(34, 40, 35))
                                     .corner_radius(egui::CornerRadius::same(8.0 as u8))
-                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94))) // #575A5E
+                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94)))
                                     .inner_margin(egui::Margin::same(12.0 as i8))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
@@ -329,9 +379,20 @@ impl eframe::App for VoiceRecorderApp {
                                                 |ui| {
                                                     if ui
                                                         .add(
+                                                            egui::Button::new("❌ Delete").fill(
+                                                                Color32::from_rgb(220, 20, 60),
+                                                            ),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        file_to_delete = Some(file_name.clone());
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            !*self.is_playing.lock().unwrap(),
                                                             egui::Button::new("▶ Play").fill(
                                                                 Color32::from_rgb(0, 180, 120),
-                                                            ), // Nice warm green
+                                                            ),
                                                         )
                                                         .clicked()
                                                     {
@@ -348,6 +409,10 @@ impl eframe::App for VoiceRecorderApp {
 
                         if let Some(file_name) = file_to_play {
                             self.play_file(&file_name);
+                        }
+
+                        if let Some(file_name) = file_to_delete {
+                            self.delete_file(&file_name);
                         }
                     });
             });

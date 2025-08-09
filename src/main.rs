@@ -34,7 +34,7 @@ struct VoiceRecorderApp {
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
     files: Vec<String>,
-    // Add a channel to communicate playback status
+
     playback_status_rx: mpsc::Receiver<()>,
     playback_status_tx: mpsc::Sender<()>,
 }
@@ -231,7 +231,6 @@ impl VoiceRecorderApp {
 
     fn stop_playback(&mut self) {
         if *self.is_playing.lock().unwrap() {
-            // Dropping the `output_stream` will stop the playback.
             self.output_stream = None;
             *self.is_playing.lock().unwrap() = false;
             self.status_message = "Playback stopped.".to_string();
@@ -252,9 +251,7 @@ impl eframe::App for VoiceRecorderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
-        // Check for playback finished signal
         if self.playback_status_rx.try_recv().is_ok() {
-            // Clean up the stream and update the state
             self.stop_playback();
             self.status_message = "Playback finished.".to_string();
         }

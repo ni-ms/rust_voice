@@ -390,8 +390,8 @@ impl VoiceRecorder {
             .filter(|c| c.channels() == spec.channels as u16)
             .min_by_key(|c| {
                 let format_priority = match c.sample_format() {
-                    SampleFormat::F32 => 0,  // Best match - same as file
-                    SampleFormat::I16 => 1,  // Good quality
+                    SampleFormat::F32 => 0,
+                    SampleFormat::I16 => 1,
                     SampleFormat::I32 => 2,
                     SampleFormat::U16 => 3,
                     SampleFormat::U8 => 100,

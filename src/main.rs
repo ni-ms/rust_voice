@@ -7,6 +7,7 @@ use std::fs;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
@@ -38,6 +39,9 @@ struct VoiceRecorderApp {
 
     playback_status_rx: mpsc::Receiver<()>,
     playback_status_tx: mpsc::Sender<()>,
+
+    start_time: Option<Instant>,
+    elapsed_time: Duration,
 }
 
 impl Default for VoiceRecorderApp {
@@ -53,6 +57,9 @@ impl Default for VoiceRecorderApp {
             files: Vec::new(),
             playback_status_tx: tx,
             playback_status_rx: rx,
+
+            start_time: None,
+            elapsed_time: Duration::new(0, 0),
         };
 
         app.update_file_list();
@@ -106,6 +113,9 @@ impl VoiceRecorderApp {
             self.input_stream = Some(stream);
             *is_recording_lock = true;
             self.status_message = "Recording...".to_string();
+
+            self.start_time = Some(Instant::now());
+            self.elapsed_time = Duration::new(0, 0);
         }
     }
 
@@ -125,6 +135,7 @@ impl VoiceRecorderApp {
         }
 
         self.input_stream = None;
+        self.start_time = None;
 
         let filename = format!("recording_{}.wav", self.files.len() + 1);
 
@@ -225,9 +236,11 @@ impl VoiceRecorderApp {
             .unwrap();
 
         stream.play().unwrap();
-        self.output_stream = Some(stream);
         *self.is_playing.lock().unwrap() = true;
+        self.output_stream = Some(stream);
         self.status_message = format!("Playing: {}", filename);
+        self.start_time = Some(Instant::now());
+        self.elapsed_time = Duration::new(0, 0);
     }
 
     fn stop_playback(&mut self) {
@@ -235,6 +248,8 @@ impl VoiceRecorderApp {
             self.output_stream = None;
             *self.is_playing.lock().unwrap() = false;
             self.status_message = "Playback stopped.".to_string();
+            self.start_time = None;
+            self.elapsed_time = Duration::new(0, 0);
         }
     }
 
@@ -255,6 +270,10 @@ impl eframe::App for VoiceRecorderApp {
         if self.playback_status_rx.try_recv().is_ok() {
             self.stop_playback();
             self.status_message = "Playback finished.".to_string();
+        }
+
+        if let Some(start_time) = self.start_time {
+            self.elapsed_time = start_time.elapsed();
         }
 
         let visuals = egui::Visuals {
@@ -285,6 +304,31 @@ impl eframe::App for VoiceRecorderApp {
                     );
                 });
 
+                ui.add_space(20.0);
+
+                let formatted_time = format!(
+                    "{:02}:{:02}.{:02}",
+                    self.elapsed_time.as_secs() / 60,
+                    self.elapsed_time.as_secs() % 60,
+                    self.elapsed_time.subsec_millis() / 10
+                );
+
+                let timer_color = if *self.is_recording.lock().unwrap() {
+                    Color32::from_rgb(220, 20, 60)
+                } else if *self.is_playing.lock().unwrap() {
+                    Color32::from_rgb(255, 140, 0)
+                } else {
+                    Color32::from_rgb(167, 162, 169)
+                };
+
+                ui.vertical_centered(|ui| {
+                    ui.heading(
+                        egui::RichText::new(formatted_time)
+                            .size(40.0)
+                            .strong()
+                            .color(timer_color),
+                    );
+                });
                 ui.add_space(20.0);
 
                 egui::Frame::default()

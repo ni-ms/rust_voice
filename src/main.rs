@@ -1,18 +1,15 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
-use eframe::{
-    egui::{self},
-    epaint::vec2,
-};
+use iced::keyboard::{self, Key};
+use iced::widget::{button, center, column, row, scrollable, text};
+use iced::{Element, Length, Subscription, Task, Theme, time};
+
 use std::fs;
 use std::io;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Stream, StreamConfig};
-use eframe::egui::Color32;
-use hound::{self, WavReader, WavSpec};
+use cpal::{SampleFormat, Stream, StreamConfig};
+use hound::{WavReader, WavSpec};
 
 fn write_wav_file(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> {
     let mut writer = hound::WavWriter::create(path, spec)
@@ -28,135 +25,192 @@ fn write_wav_file(path: &str, spec: WavSpec, samples: &[f32]) -> io::Result<()> 
     Ok(())
 }
 
-struct VoiceRecorderApp {
-    is_recording: Arc<Mutex<bool>>,
-    is_playing: Arc<Mutex<bool>>,
-    audio_data: Arc<Mutex<Vec<f32>>>,
-    status_message: String,
-    input_stream: Option<Stream>,
-    output_stream: Option<Stream>,
-    files: Vec<String>,
-
-    playback_status_rx: mpsc::Receiver<()>,
-    playback_status_tx: mpsc::Sender<()>,
-
-    start_time: Option<Instant>,
-    elapsed_time: Duration,
-}
-
-impl Default for VoiceRecorderApp {
-    fn default() -> Self {
-        let (tx, rx) = mpsc::channel();
-        let mut app = Self {
-            is_recording: Arc::new(Mutex::new(false)),
-            is_playing: Arc::new(Mutex::new(false)),
-            audio_data: Arc::new(Mutex::new(Vec::new())),
-            status_message: "Ready to record.".to_string(),
-            input_stream: None,
-            output_stream: None,
-            files: Vec::new(),
-            playback_status_tx: tx,
-            playback_status_rx: rx,
-
-            start_time: None,
-            elapsed_time: Duration::new(0, 0),
-        };
-
-        app.update_file_list();
-        app
-    }
-}
-
-impl VoiceRecorderApp {
-    fn update_file_list(&mut self) {
-        self.files.clear();
-        if let Ok(entries) = fs::read_dir(".") {
-            for entry in entries.flatten() {
-                if let Some(file_name) = entry.file_name().to_str() {
-                    if file_name.ends_with(".wav") {
-                        self.files.push(file_name.to_string());
-                    }
+fn list_wav_files() -> Vec<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(".") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.to_lowercase().ends_with(".wav") {
+                    files.push(name.to_string());
                 }
             }
         }
     }
+    files
+}
 
-    fn start_recording(&mut self) {
-        let mut is_recording_lock = self.is_recording.lock().unwrap();
+#[derive(Debug, Clone)]
+enum Message {
+    StartRecording,
+    StopRecording,
+    PlayFile(String),
+    StopPlayback,
+    DeleteFile(String),
+    Tick(Instant),
+    Toggle,
+    Reset,
+}
 
-        if !*is_recording_lock {
-            self.audio_data.lock().unwrap().clear();
+struct VoiceRecorder {
+    is_recording: bool,
+    is_playing: bool,
+    status_message: String,
+    files: Vec<String>,
+    audio_data: Arc<Mutex<Vec<f32>>>,
+    input_stream: Option<Stream>,
+    output_stream: Option<Stream>,
+    playback_status_tx: mpsc::Sender<()>,
+    playback_status_rx: mpsc::Receiver<()>,
+    start_time: Option<Instant>,
+    elapsed_time: Duration,
+}
 
-            let host = cpal::default_host();
-            let device = host
-                .default_input_device()
-                .expect("Failed to find default input device");
-            let config = device
-                .default_input_config()
-                .expect("Failed to get default input config");
-
-            let audio_data_callback = Arc::clone(&self.audio_data);
-
-            let stream = device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        audio_data_callback.lock().unwrap().extend_from_slice(data);
-                    },
-                    |err| eprintln!("An error occurred on the audio stream: {}", err),
-                    None,
-                )
-                .unwrap();
-
-            stream.play().unwrap();
-
-            self.input_stream = Some(stream);
-            *is_recording_lock = true;
-            self.status_message = "Recording...".to_string();
-
-            self.start_time = Some(Instant::now());
-            self.elapsed_time = Duration::new(0, 0);
+impl Default for VoiceRecorder {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            is_recording: false,
+            is_playing: false,
+            status_message: "Ready to record.".into(),
+            files: list_wav_files(),
+            audio_data: Arc::new(Mutex::new(Vec::new())),
+            input_stream: None,
+            output_stream: None,
+            playback_status_tx: tx,
+            playback_status_rx: rx,
+            start_time: None,
+            elapsed_time: Duration::from_secs(0),
         }
     }
+}
 
-    fn stop_recording(&mut self) {
-        let was_recording = {
-            let mut is_recording = self.is_recording.lock().unwrap();
-            if *is_recording {
-                *is_recording = false;
-                true
-            } else {
-                false
+impl VoiceRecorder {
+    fn start_recording_impl(&mut self) {
+        if self.is_recording {
+            return;
+        }
+
+        self.audio_data.lock().unwrap().clear();
+        let host = cpal::default_host();
+
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                self.status_message = "No input device found.".into();
+                return;
             }
         };
 
-        if !was_recording {
+        let default_config = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = format!("Failed to get default input config: {}", e);
+                return;
+            }
+        };
+
+        let config: StreamConfig = default_config.clone().into();
+        let audio_buf = Arc::clone(&self.audio_data);
+
+        let build_result = match default_config.sample_format() {
+            SampleFormat::F32 => device.build_input_stream(
+                &config,
+                move |data: &[f32], _| {
+                    let mut buf = audio_buf.lock().unwrap();
+                    buf.extend_from_slice(data);
+                },
+                move |err| {
+                    eprintln!("Input stream error: {}", err);
+                },
+                None,
+            ),
+            SampleFormat::I16 => {
+                let audio_buf = Arc::clone(&self.audio_data);
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        let mut buf = audio_buf.lock().unwrap();
+                        buf.extend(data.iter().map(|&s| (s as f32) / (i16::MAX as f32)));
+                    },
+                    move |err| {
+                        eprintln!("Input stream error: {}", err);
+                    },
+                    None,
+                )
+            }
+            SampleFormat::U16 => {
+                let audio_buf = Arc::clone(&self.audio_data);
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        let mut buf = audio_buf.lock().unwrap();
+                        buf.extend(
+                            data.iter()
+                                .map(|&s| (s as f32) / (u16::MAX as f32) * 2.0 - 1.0),
+                        );
+                    },
+                    move |err| {
+                        eprintln!("Input stream error: {}", err);
+                    },
+                    None,
+                )
+            }
+            _ => {
+                self.status_message = "Unsupported sample format".into();
+                return;
+            }
+        };
+
+        match build_result {
+            Ok(stream) => {
+                if let Err(e) = stream.play() {
+                    self.status_message = format!("Failed to start input stream: {}", e);
+                    return;
+                }
+                self.input_stream = Some(stream);
+                self.is_recording = true;
+                self.status_message = "Recording...".into();
+                self.start_time = Some(Instant::now());
+                self.elapsed_time = Duration::from_secs(0);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to build input stream: {}", e);
+            }
+        }
+    }
+
+    fn stop_recording_impl(&mut self) {
+        if !self.is_recording {
             return;
         }
 
         self.input_stream = None;
+        self.is_recording = false;
         self.start_time = None;
 
         let filename = format!("recording_{}.wav", self.files.len() + 1);
-
-        let samples: Vec<f32> = {
-            let mut audio_data = self.audio_data.lock().unwrap();
-
-            std::mem::take(&mut *audio_data)
-        };
+        let samples: Vec<f32> = std::mem::take(&mut *self.audio_data.lock().unwrap());
 
         if samples.is_empty() {
-            self.status_message = "Error saving file: No audio data captured".to_string();
+            self.status_message = "Error saving file: No audio data captured".into();
             return;
         }
 
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .expect("Failed to find default input device");
-        let config = device
-            .default_input_config()
-            .expect("Failed to get default input config");
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                self.status_message = "Failed to find default input device".into();
+                return;
+            }
+        };
+        let config = match device.default_input_config() {
+            Ok(conf) => conf,
+            Err(e) => {
+                self.status_message = format!("Failed to get default input config: {}", e);
+                return;
+            }
+        };
 
         let spec = WavSpec {
             channels: config.channels() as u16,
@@ -168,8 +222,7 @@ impl VoiceRecorderApp {
         match write_wav_file(&filename, spec, &samples) {
             Ok(()) => {
                 self.status_message = format!("Recording stopped. File saved as '{}'", filename);
-
-                self.update_file_list();
+                self.files = list_wav_files();
             }
             Err(e) => {
                 self.status_message = format!("Error saving file: {}", e);
@@ -177,14 +230,14 @@ impl VoiceRecorderApp {
         }
     }
 
-    fn play_file(&mut self, filename: &str) {
-        if *self.is_playing.lock().unwrap() {
+    fn play_file_impl(&mut self, filename: &str) {
+        if self.is_playing {
             return;
         }
 
-        self.stop_playback();
+        self.stop_playback_impl();
 
-        let mut reader = match WavReader::open(filename) {
+        let reader = match WavReader::open(filename) {
             Ok(r) => r,
             Err(e) => {
                 self.status_message = format!("Error opening file: {}", e);
@@ -193,282 +246,323 @@ impl VoiceRecorderApp {
         };
 
         let spec = reader.spec();
-        let samples: Vec<f32> = reader.samples().filter_map(Result::ok).collect();
+        let samples_res: Result<Vec<f32>, _> = reader.into_samples::<f32>().collect();
+        let samples = match samples_res {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_message = format!("Error reading samples: {}", e);
+                return;
+            }
+        };
+
+        if samples.is_empty() {
+            self.status_message = "File contains no samples.".into();
+            return;
+        }
+
         let samples_arc = Arc::new(Mutex::new(samples));
-        let playback_status_tx = self.playback_status_tx.clone();
+        let play_tx = self.playback_status_tx.clone();
 
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .expect("Failed to find default output device");
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                self.status_message = "Failed to find default output device".into();
+                return;
+            }
+        };
 
-        let supported_configs = device
-            .supported_output_configs()
-            .expect("error querying supported output configs");
+        let supported_cfgs = match device.supported_output_configs() {
+            Ok(v) => v.collect::<Vec<_>>(),
+            Err(e) => {
+                self.status_message = format!("Error querying output configs: {}", e);
+                return;
+            }
+        };
 
-        let supported_config = supported_configs
+        let matched = supported_cfgs
+            .into_iter()
             .filter(|c| c.channels() == spec.channels as u16)
-            .min_by_key(|c| (c.max_sample_rate().0 as i64 - spec.sample_rate as i64).abs())
-            .expect("No supported config found");
+            .min_by_key(|c| ((c.max_sample_rate().0 as i64) - (spec.sample_rate as i64)).abs());
 
-        let config: StreamConfig = supported_config
-            .with_sample_rate(supported_config.max_sample_rate())
-            .into();
+        let chosen = match matched {
+            Some(c) => c.with_sample_rate(c.max_sample_rate()),
+            None => {
+                self.status_message =
+                    "No supported output config found matching file channels.".into();
+                return;
+            }
+        };
 
-        let samples_callback = Arc::clone(&samples_arc);
+        let sample_format = chosen.sample_format(); // Get this first
+        let stream_config: StreamConfig = chosen.into(); // Now move chosen
+        let samples_for_callback = Arc::clone(&samples_arc);
+        let play_tx_clone = play_tx.clone();
 
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut samples_lock = samples_callback.lock().unwrap();
-                    let len = data.len().min(samples_lock.len());
-                    data[..len].copy_from_slice(&samples_lock[..len]);
-                    samples_lock.drain(..len);
-
-                    if samples_lock.is_empty() {
-                        let _ = playback_status_tx.send(());
+        let build_out = match sample_format {
+            // Use the extracted value
+            SampleFormat::F32 => device.build_output_stream(
+                &stream_config,
+                move |out: &mut [f32], _| {
+                    let mut buf = samples_for_callback.lock().unwrap();
+                    let len = out.len().min(buf.len());
+                    if len > 0 {
+                        out[..len].copy_from_slice(&buf[..len]);
+                        buf.drain(..len);
+                    } else {
+                        for o in out.iter_mut() {
+                            *o = 0.0;
+                        }
+                    }
+                    if buf.is_empty() {
+                        let _ = play_tx_clone.send(());
                     }
                 },
-                |err| eprintln!("An error occurred on the audio stream: {}", err),
+                move |err| eprintln!("Output stream error: {}", err),
                 None,
-            )
-            .unwrap();
-
-        stream.play().unwrap();
-        *self.is_playing.lock().unwrap() = true;
-        self.output_stream = Some(stream);
-        self.status_message = format!("Playing: {}", filename);
-        self.start_time = Some(Instant::now());
-        self.elapsed_time = Duration::new(0, 0);
-    }
-
-    fn stop_playback(&mut self) {
-        if *self.is_playing.lock().unwrap() {
-            self.output_stream = None;
-            *self.is_playing.lock().unwrap() = false;
-            self.status_message = "Playback stopped.".to_string();
-            self.start_time = None;
-            self.elapsed_time = Duration::new(0, 0);
-        }
-    }
-
-    fn delete_file(&mut self, filename: &str) {
-        if let Err(e) = fs::remove_file(filename) {
-            self.status_message = format!("Error deleting file: {}", e);
-        } else {
-            self.status_message = format!("Deleted file: {}", filename);
-            self.update_file_list();
-        }
-    }
-}
-
-impl eframe::App for VoiceRecorderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
-
-        if self.playback_status_rx.try_recv().is_ok() {
-            self.stop_playback();
-            self.status_message = "Playback finished.".to_string();
-        }
-
-        if let Some(start_time) = self.start_time {
-            self.elapsed_time = start_time.elapsed();
-        }
-
-        let visuals = egui::Visuals {
-            dark_mode: true,
-            override_text_color: Some(Color32::from_rgb(244, 247, 245)),
-            ..Default::default()
-        };
-        ctx.set_visuals(visuals);
-
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(8, 9, 10))
-                    .inner_margin(egui::Margin::same(12.0 as i8)),
-            )
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading(
-                        egui::RichText::new("Voice Recorder")
-                            .size(30.0)
-                            .strong()
-                            .color(Color32::from_rgb(244, 247, 245)),
-                    );
-                    ui.label(
-                        egui::RichText::new(&self.status_message)
-                            .size(16.0)
-                            .color(Color32::from_rgb(167, 162, 169)),
-                    );
-                });
-
-                ui.add_space(20.0);
-
-                let formatted_time = format!(
-                    "{:02}:{:02}.{:02}",
-                    self.elapsed_time.as_secs() / 60,
-                    self.elapsed_time.as_secs() % 60,
-                    self.elapsed_time.subsec_millis() / 10
-                );
-
-                let timer_color = if *self.is_recording.lock().unwrap() {
-                    Color32::from_rgb(220, 20, 60)
-                } else if *self.is_playing.lock().unwrap() {
-                    Color32::from_rgb(255, 140, 0)
-                } else {
-                    Color32::from_rgb(167, 162, 169)
-                };
-
-                ui.vertical_centered(|ui| {
-                    ui.heading(
-                        egui::RichText::new(formatted_time)
-                            .size(40.0)
-                            .strong()
-                            .color(timer_color),
-                    );
-                });
-                ui.add_space(20.0);
-
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(34, 40, 35))
-                    .corner_radius(egui::CornerRadius::same(10.0 as u8))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94)))
-                    .inner_margin(egui::Margin::same(16.0 as i8))
-                    .show(ui, |ui| {
-                        let is_recording = *self.is_recording.lock().unwrap();
-                        let is_playing = *self.is_playing.lock().unwrap();
-
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(!is_recording && !is_playing, |ui| {
-                                if ui
-                                    .add_sized(
-                                        [120.0, 40.0],
-                                        egui::Button::new("⏺ Record")
-                                            .fill(Color32::from_rgb(220, 20, 60)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.start_recording();
-                                }
-                            });
-
-                            ui.add_enabled_ui(is_recording, |ui| {
-                                if ui
-                                    .add_sized(
-                                        [120.0, 40.0],
-                                        egui::Button::new("⏹ Stop")
-                                            .fill(Color32::from_rgb(87, 90, 94)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.stop_recording();
-                                }
-                            });
-
-                            ui.add_enabled_ui(is_playing, |ui| {
-                                if ui
-                                    .add_sized(
-                                        [120.0, 40.0],
-                                        egui::Button::new("◼ Stop Playback")
-                                            .fill(Color32::from_rgb(255, 140, 0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.stop_playback();
-                                }
-                            });
-                        });
-                    });
-
-                ui.add_space(24.0);
-                ui.heading(
-                    egui::RichText::new("📁 Recorded Files")
-                        .size(22.0)
-                        .color(Color32::from_rgb(244, 247, 245)),
-                );
-                ui.add_space(10.0);
-
-                egui::ScrollArea::vertical()
-                    .max_height(240.0)
-                    .show(ui, |ui| {
-                        let mut file_to_play: Option<String> = None;
-                        let mut file_to_delete: Option<String> = None;
-
-                        if self.files.is_empty() {
-                            ui.label(
-                                egui::RichText::new("No recordings found.")
-                                    .color(Color32::from_rgb(167, 162, 169)),
-                            );
-                        } else {
-                            for file_name in &self.files {
-                                egui::Frame::default()
-                                    .fill(Color32::from_rgb(34, 40, 35))
-                                    .corner_radius(egui::CornerRadius::same(8.0 as u8))
-                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(87, 90, 94)))
-                                    .inner_margin(egui::Margin::same(12.0 as i8))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(file_name)
-                                                    .size(16.0)
-                                                    .color(Color32::from_rgb(244, 247, 245)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new("❌ Delete").fill(
-                                                                Color32::from_rgb(220, 20, 60),
-                                                            ),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        file_to_delete = Some(file_name.clone());
-                                                    }
-                                                    if ui
-                                                        .add_enabled(
-                                                            !*self.is_playing.lock().unwrap(),
-                                                            egui::Button::new("▶ Play").fill(
-                                                                Color32::from_rgb(0, 180, 120),
-                                                            ),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        file_to_play = Some(file_name.clone());
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
-
-                                ui.add_space(6.0);
+            ),
+            SampleFormat::I16 => {
+                let samples_for_callback = Arc::clone(&samples_arc);
+                device.build_output_stream(
+                    &stream_config,
+                    move |out: &mut [i16], _| {
+                        let mut buf = samples_for_callback.lock().unwrap();
+                        let len = out.len().min(buf.len());
+                        for i in 0..len {
+                            let s = (buf[i] * (i16::MAX as f32)) as i16;
+                            out[i] = s;
+                        }
+                        if len < out.len() {
+                            for i in len..out.len() {
+                                out[i] = 0;
                             }
                         }
-
-                        if let Some(file_name) = file_to_play {
-                            self.play_file(&file_name);
+                        if buf.len() >= len {
+                            buf.drain(..len);
+                        } else {
+                            buf.clear();
                         }
-
-                        if let Some(file_name) = file_to_delete {
-                            self.delete_file(&file_name);
+                        if buf.is_empty() {
+                            let _ = play_tx_clone.send(());
                         }
-                    });
-            });
+                    },
+                    move |err| eprintln!("Output stream error: {}", err),
+                    None,
+                )
+            }
+            SampleFormat::U16 => {
+                let samples_for_callback = Arc::clone(&samples_arc);
+                device.build_output_stream(
+                    &stream_config,
+                    move |out: &mut [u16], _| {
+                        let mut buf = samples_for_callback.lock().unwrap();
+                        let len = out.len().min(buf.len());
+                        for i in 0..len {
+                            let v = ((buf[i] * 0.5 + 0.5) * (u16::MAX as f32))
+                                .clamp(0.0, u16::MAX as f32);
+                            out[i] = v as u16;
+                        }
+                        if len < out.len() {
+                            for i in len..out.len() {
+                                out[i] = u16::MAX / 2;
+                            }
+                        }
+                        if buf.len() >= len {
+                            buf.drain(..len);
+                        } else {
+                            buf.clear();
+                        }
+                        if buf.is_empty() {
+                            let _ = play_tx_clone.send(());
+                        }
+                    },
+                    move |err| eprintln!("Output stream error: {}", err),
+                    None,
+                )
+            }
+            SampleFormat::U8 => {
+                let samples_for_callback = Arc::clone(&samples_arc);
+                device.build_output_stream(
+                    &stream_config,
+                    move |out: &mut [u8], _| {
+                        let mut buf = samples_for_callback.lock().unwrap();
+                        let len = out.len().min(buf.len());
+                        for i in 0..len {
+                            // Convert f32 (-1.0..1.0) to u8 (0..255)
+                            // 128 = silence, <128 = negative, >128 = positive
+                            let v = ((buf[i] + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
+                            out[i] = v as u8;
+                        }
+                        // Fill remaining with silence (128 for U8)
+                        if len < out.len() {
+                            out[len..].fill(128);
+                        }
+                        // Remove processed samples
+                        if buf.len() >= len {
+                            buf.drain(..len);
+                        } else {
+                            buf.clear();
+                        }
+                        // Signal playback finished
+                        if buf.is_empty() {
+                            let _ = play_tx_clone.send(());
+                        }
+                    },
+                    move |err| eprintln!("Output stream error: {}", err),
+                    None,
+                )
+            }
+            _ => {
+                self.status_message =
+                    format!("Unsupported output sample format: {:?}", sample_format);
+                return;
+            }
+        };
+
+        match build_out {
+            Ok(stream) => {
+                if let Err(e) = stream.play() {
+                    self.status_message = format!("Failed to start output stream: {}", e);
+                    return;
+                }
+                self.output_stream = Some(stream);
+                self.is_playing = true;
+                self.status_message = format!("Playing: {}", filename);
+                self.start_time = Some(Instant::now());
+                self.elapsed_time = Duration::from_secs(0);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to build output stream: {}", e);
+            }
+        }
+    }
+
+    fn stop_playback_impl(&mut self) {
+        if self.is_playing {
+            self.output_stream = None;
+            self.is_playing = false;
+            self.status_message = "Playback stopped.".into();
+            self.start_time = None;
+            self.elapsed_time = Duration::from_secs(0);
+        }
+    }
+
+    fn delete_file_impl(&mut self, filename: &str) {
+        match fs::remove_file(filename) {
+            Ok(_) => {
+                self.status_message = format!("Deleted file: {}", filename);
+                self.files = list_wav_files();
+            }
+            Err(e) => {
+                self.status_message = format!("Error deleting file: {}", e);
+            }
+        }
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::StartRecording => self.start_recording_impl(),
+            Message::StopRecording => self.stop_recording_impl(),
+            Message::PlayFile(fname) => self.play_file_impl(&fname),
+            Message::StopPlayback => self.stop_playback_impl(),
+            Message::DeleteFile(fname) => self.delete_file_impl(&fname),
+            Message::Tick(now) => {
+                if let Some(start) = self.start_time {
+                    self.elapsed_time = now - start;
+                }
+
+                if self.playback_status_rx.try_recv().is_ok() {
+                    self.stop_playback_impl();
+                    self.status_message = "Playback finished.".into();
+                }
+            }
+            Message::Toggle => {
+                if self.is_recording {
+                    self.stop_recording_impl();
+                } else {
+                    self.start_recording_impl();
+                }
+            }
+            Message::Reset => {}
+        }
+        Task::none()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let tick = if self.is_recording || self.is_playing {
+            time::every(Duration::from_millis(16)).map(Message::Tick)
+        } else {
+            Subscription::none()
+        };
+
+        let keyboard = keyboard::on_key_press(|key, _modifiers| match key {
+            Key::Named(keyboard::key::Named::Space) => Some(Message::Toggle),
+            Key::Character(ref c) if c == "p" => Some(Message::StopPlayback),
+            _ => None,
+        });
+
+        Subscription::batch(vec![tick, keyboard])
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let secs = self.elapsed_time.as_secs();
+        let cs = (self.elapsed_time.subsec_millis() / 10) as u64;
+        let formatted = format!("{:02}:{:02}.{:02}", secs / 60, secs % 60, cs);
+
+        let timer_text = text(formatted).size(40); // Remove & here - pass owned String
+
+        let record_button = if !self.is_recording && !self.is_playing {
+            button(text("⏺ Record")).on_press(Message::StartRecording)
+        } else {
+            button(text("⏹ Stop")).on_press(Message::StopRecording)
+        };
+
+        let stop_playback_button = if self.is_playing {
+            button(text("◼ Stop Playback")).on_press(Message::StopPlayback)
+        } else {
+            button(text("◼ Stop Playback"))
+        };
+
+        let files_content = if self.files.is_empty() {
+            column![text("No recordings found.")]
+        } else {
+            let mut files_col = column![];
+            for file_name in &self.files {
+                let row = row![
+                    text(file_name), // Use reference to self.files data
+                    button(text("▶ Play")).on_press(Message::PlayFile(file_name.clone())),
+                    button(text("❌ Delete")).on_press(Message::DeleteFile(file_name.clone())),
+                ]
+                .spacing(12);
+                files_col = files_col.push(row);
+            }
+            files_col
+        };
+
+        let files_scroll = scrollable(files_content).height(Length::Fixed(220.0));
+
+        let content = column![
+            text("Voice Recorder").size(30),
+            text(&self.status_message).size(16), // Reference to self field is OK
+            timer_text,
+            row![record_button, stop_playback_button].spacing(12),
+            text("Recorded Files").size(22),
+            files_scroll
+        ]
+        .spacing(16)
+        .align_x(iced::Alignment::Center);
+
+        center(content).into()
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
     }
 }
 
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(vec2(400.0, 400.0)),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Voice Recorder",
-        options,
-        Box::new(|_cc| Ok(Box::new(VoiceRecorderApp::default()))),
-    )
+pub fn main() -> iced::Result {
+    iced::application("Voice Recorder", VoiceRecorder::update, VoiceRecorder::view)
+        .subscription(VoiceRecorder::subscription)
+        .theme(VoiceRecorder::theme)
+        .run()
 }

@@ -1,6 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 use iced::keyboard::{self, Key};
-use iced::widget::{button, center, column, row, scrollable, text};
+use iced::widget::{button, center, column, row, scrollable, text, text_input};
 use iced::{Element, Length, Subscription, Task, Theme, time};
 
 use std::fs;
@@ -62,6 +62,10 @@ enum Message {
     PlayFile(String),
     StopPlayback,
     DeleteFile(String),
+    StartRename(String),
+    UpdateRenameName(String),
+    ConfirmRename,
+    CancelRename,
     Tick(Instant),
     Toggle,
     Reset,
@@ -81,8 +85,10 @@ struct VoiceRecorder {
     start_time: Option<Instant>,
     elapsed_time: Duration,
     stopping_time: Option<Instant>,
-    recording_sample_rate: u32, // NEW: Track actual recording sample rate
-    recording_channels: u16,    // NEW: Track actual recording channels
+    recording_sample_rate: u32,
+    recording_channels: u16,
+    renaming_file: Option<String>,
+    new_name: String,
 }
 
 impl Default for VoiceRecorder {
@@ -101,8 +107,10 @@ impl Default for VoiceRecorder {
             start_time: None,
             elapsed_time: Duration::from_secs(0),
             stopping_time: None,
-            recording_sample_rate: 48000, // NEW: Default sample rate
-            recording_channels: 1,        // NEW: Default channels
+            recording_sample_rate: 48000,
+            recording_channels: 1,
+            renaming_file: None,
+            new_name: String::new(),
         }
     }
 }
@@ -149,7 +157,6 @@ impl VoiceRecorder {
             }
         };
 
-        // NEW: Store the actual recording configuration
         self.recording_sample_rate = config.sample_rate.0;
         self.recording_channels = config.channels as u16;
 
@@ -274,6 +281,49 @@ impl VoiceRecorder {
                 self.status_message = format!("Error saving file: {}", e);
             }
         }
+    }
+
+    fn start_rename_impl(&mut self, filename: &str) {
+        self.renaming_file = Some(filename.to_string());
+        let name_without_ext = filename.strip_suffix(".wav").unwrap_or(filename);
+        self.new_name = name_without_ext.to_string();
+    }
+
+    fn confirm_rename_impl(&mut self) {
+        if let Some(old_name) = &self.renaming_file {
+            let mut new_filename = self.new_name.trim().to_string();
+            if new_filename.is_empty() {
+                self.status_message = "Filename cannot be empty.".into();
+                return;
+            }
+
+            if !new_filename.to_lowercase().ends_with(".wav") {
+                new_filename.push_str(".wav");
+            }
+
+            if new_filename != *old_name && std::path::Path::new(&new_filename).exists() {
+                self.status_message = "File with that name already exists.".into();
+                return;
+            }
+
+            match std::fs::rename(old_name, &new_filename) {
+                Ok(()) => {
+                    self.status_message = format!("Renamed '{}' to '{}'", old_name, new_filename);
+                    self.files = list_wav_files();
+                    self.renaming_file = None;
+                    self.new_name.clear();
+                }
+                Err(e) => {
+                    self.status_message = format!("Error renaming file: {}", e);
+                }
+            }
+        }
+    }
+
+    fn cancel_rename_impl(&mut self) {
+        self.renaming_file = None;
+        self.new_name.clear();
+        self.status_message = "Rename cancelled.".into();
     }
 
     fn play_file_impl(&mut self, filename: &str) {
@@ -617,6 +667,12 @@ impl VoiceRecorder {
             Message::PlayFile(fname) => self.play_file_impl(&fname),
             Message::StopPlayback => self.stop_playback_impl(),
             Message::DeleteFile(fname) => self.delete_file_impl(&fname),
+            Message::StartRename(filename) => self.start_rename_impl(&filename),
+            Message::UpdateRenameName(name) => {
+                self.new_name = name;
+            },
+            Message::ConfirmRename => self.confirm_rename_impl(),
+            Message::CancelRename => self.cancel_rename_impl(),
             Message::FinalizeRecording => self.finalize_recording(),
             Message::Tick(now) => {
                 if let Some(start) = self.start_time {
@@ -687,13 +743,38 @@ impl VoiceRecorder {
         } else {
             let mut files_col = column![];
             for file_name in &self.files {
-                let row = row![
-                    text(file_name).width(Length::Fill),
-                    button(text("► Play")).on_press(Message::PlayFile(file_name.clone())),
-                    button(text("✕ Delete")).on_press(Message::DeleteFile(file_name.clone())),
-                ]
-                .spacing(12);
-                files_col = files_col.push(row);
+                let row_content = if let Some(renaming) = &self.renaming_file {
+                    if renaming == file_name {
+                        // Show rename input
+                        row![
+                            text_input("Enter new name...", &self.new_name)
+                                .on_input(Message::UpdateRenameName)
+                                .width(Length::Fill),
+                            button(text("✓")).on_press(Message::ConfirmRename),
+                            button(text("✗")).on_press(Message::CancelRename),
+                        ]
+                            .spacing(8)
+                    } else {
+                        // Show regular file row but disabled
+                        row![
+                            text(file_name).width(Length::Fill),
+                        button(text("►")),
+                        button(text("Edit")),
+                        button(text("X")),
+                        ]
+                            .spacing(8)
+                    }
+                } else {
+                    // Show normal file row with all buttons active
+                    row![
+                        text(file_name).width(Length::Fill),
+                    button(text("►")).on_press(Message::PlayFile(file_name.clone())),
+                    button(text("Edit")).on_press(Message::StartRename(file_name.clone())),
+                    button(text("X")).on_press(Message::DeleteFile(file_name.clone())),
+                    ]
+                        .spacing(8)
+                };
+                files_col = files_col.push(row_content);
             }
             files_col
         };
@@ -708,8 +789,8 @@ impl VoiceRecorder {
             text("Recorded Files").size(22),
             files_scroll
         ]
-        .spacing(16)
-        .align_x(iced::Alignment::Center);
+            .spacing(16)
+            .align_x(iced::Alignment::Center);
 
         center(content).into()
     }

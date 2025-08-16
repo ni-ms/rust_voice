@@ -13,6 +13,9 @@ env:
 jobs:
   build-windows:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write    # Required for creating releases and tags
+      pull-requests: read
 
     steps:
     - name: Checkout code
@@ -45,20 +48,75 @@ jobs:
     - name: Create release package
       run: |
         mkdir -p release
-        echo "# Rust Voice Recorder v${{ steps.get_version.outputs.version }}" > release/README.md
-        echo "" >> release/README.md
-        echo "This is a Rust-based voice recorder application." >> release/README.md
-        echo "" >> release/README.md
-        echo "## Features:" >> release/README.md
-        echo "- Record audio using microphone" >> release/README.md
-        echo "- Play back recordings" >> release/README.md
-        echo "- Rename and delete recordings" >> release/README.md
-        echo "- Keyboard shortcuts (Space to toggle recording, P to stop playback)" >> release/README.md
-        echo "" >> release/README.md
-        echo "## Usage:" >> release/README.md
-        echo "Simply run rust_voice.exe - no installation required!" >> release/README.md
         
+        # Create comprehensive README
+        cat > release/README.md << 'EOF'
+        # 🎤 Rust Voice Recorder v${{ steps.get_version.outputs.version }}
+        
+        A simple, lightweight voice recorder built with Rust.
+        
+        ## ⚠️ Windows Security Warning
+        
+        **Windows may show a security warning** when running this application because it's not code-signed. This is a **false positive** - the software is completely safe to use.
+        
+        **To run the application:**
+        1. Download and extract the zip file
+        2. Run `rust_voice.exe`
+        3. If Windows shows a warning, click "More info" then "Run anyway"
+        
+        **Why this happens:** Code signing certificates cost $100+ per year. As a free, open-source project, we haven't purchased one. You can verify the software's safety by reviewing our source code and build process on GitHub.
+        
+        ## ✨ Features
+        
+        - 🎤 **Record audio** using your microphone
+        - ▶️ **Play recordings** with high-quality playback
+        - ✏️ **Rename recordings** with custom names
+        - 🗑️ **Delete recordings** you no longer need
+        - ⌨️ **Keyboard shortcuts**:
+          - `Spacebar` - Start/stop recording
+          - `P` - Stop playback
+        - 🎯 **Lightweight** - Small file size, no installation required
+        - 🔒 **Privacy-focused** - All recordings stay on your computer
+        
+        ## 🚀 Usage
+        
+        1. Double-click `rust_voice.exe` to launch
+        2. Click "● Record" or press Spacebar to start recording
+        3. Click "■ Stop" or press Spacebar again to stop
+        4. Your recording appears in the file list
+        5. Use ► to play, Edit to rename, X to delete
+        
+        ## 🛠️ Technical Details
+        
+        - **Audio Format:** 48kHz WAV files
+        - **Built with:** Rust, CPAL (audio), Iced (GUI), Hound (WAV)
+        - **Requirements:** Windows 10/11 (64-bit)
+        - **Size:** ~5MB executable
+        
+        ## 🐛 Troubleshooting
+        
+        **No sound during recording?**
+        - Check your microphone permissions in Windows Settings
+        - Ensure your microphone is set as the default recording device
+        
+        **Can't hear playback?**
+        - Check your speaker/headphone volume
+        - Ensure your audio output device is working
+        
+        **Antivirus deleted the file?**
+        - Add the executable to your antivirus whitelist/exceptions
+        - This is a common false positive for unsigned executables
+        
+        ---
+        
+        💡 **Found a bug or have a suggestion?** 
+        Visit our [GitHub repository](https://github.com/ni-ms/rust_voice) to report issues or contribute!
+        EOF
+        
+        # Copy executable
         cp target/x86_64-pc-windows-gnu/release/rust_voice.exe release/
+        
+        # Create zip with version in name
         cd release && zip -r ../rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip . && cd ..
 
     - name: Upload build artifact
@@ -89,25 +147,49 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ steps.get_version.outputs.tag }}
-        name: Release ${{ steps.get_version.outputs.tag }}
+        name: "🎤 Voice Recorder ${{ steps.get_version.outputs.tag }}"
         body: |
-          ## Rust Voice Recorder ${{ steps.get_version.outputs.tag }}
+          ## 🚀 What's New in ${{ steps.get_version.outputs.tag }}
           
-          ### Features:
-          - 🎤 Record audio using your microphone
-          - ▶️ Play back recordings
-          - ✏️ Rename recordings
-          - 🗑️ Delete recordings
-          - ⌨️ Keyboard shortcuts (Space to toggle, P to stop)
+          A lightweight, privacy-focused voice recorder built with Rust.
           
-          ### Installation:
-          1. Download the zip file below
-          2. Extract rust_voice.exe
-          3. Run the executable - no installation needed!
+          ### ✨ Features
+          - 🎤 High-quality audio recording (48kHz WAV)
+          - ▶️ Instant playback of recordings  
+          - ✏️ Easy file renaming and management
+          - ⌨️ Convenient keyboard shortcuts
+          - 🔒 Complete privacy - all data stays local
           
-          **Note**: Windows may show a security warning since the executable is not code-signed. This is a false positive - the application is safe to use.
+          ### 📥 Installation
+          1. **Download** the zip file below
+          2. **Extract** `rust_voice.exe` anywhere on your computer
+          3. **Run** the executable - no installation needed!
+          
+          ### ⚠️ Important: Windows Security Warning
+          
+          **Windows will show a security warning** because this app isn't code-signed (certificates cost $100+/year). This is a **false positive**.
+          
+          **The app is completely safe** - you can verify by:
+          - ✅ Reviewing our open source code
+          - ✅ Checking our automated build process  
+          - ✅ No network connections (privacy-focused)
+          
+          **To run:** Click "More info" → "Run anyway" on the Windows warning.
+          
+          ### 🎯 Quick Start
+          - Press **Spacebar** to start/stop recording
+          - Press **P** to stop playback  
+          - All recordings saved as WAV files in app folder
+          
+          ### 🐛 Issues or Questions?
+          Report bugs or request features in our [Issues section](https://github.com/ni-ms/rust_voice/issues).
+          
+          ---
+          
+          **Download count will show here after release** 📊
         files: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
         draft: false
         prerelease: false
+        generate_release_notes: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

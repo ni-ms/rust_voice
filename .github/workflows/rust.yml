@@ -3,7 +3,6 @@ name: Rust Windows Build & Release
 on:
   push:
     branches: [ "master" ]
-    tags: [ "v*" ]  # Triggers on version tags like v1.0.0
   pull_request:
     branches: [ "master" ]
   workflow_dispatch:
@@ -18,35 +17,97 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for versioning
 
     - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y libasound2-dev mingw-w64
 
-    - name: Add Windows target
-      run: rustup target add x86_64-pc-windows-gnu
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: x86_64-pc-windows-gnu
+        override: true
 
     - name: Build for Windows (Release)
       run: cargo build --release --target x86_64-pc-windows-gnu --verbose
 
-    - name: Add README and zip
+    - name: Get version from Cargo.toml
+      id: get_version
       run: |
-        mkdir -p dist
-        echo "This is a Rust-based voice recorder tool using CPAL and EGUI." > dist/README.txt
-        cp target/x86_64-pc-windows-gnu/release/rust_voice.exe dist/rust_voice.exe
-        zip -r rust_voice_windows.zip dist/
+        VERSION=$(grep '^version = ' Cargo.toml | head -n1 | sed 's/version = "//;s/"//')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "tag=v$VERSION" >> $GITHUB_OUTPUT
 
-    - name: Upload zipped binary to Actions
+    - name: Create release package
+      run: |
+        mkdir -p release
+        echo "# Rust Voice Recorder v${{ steps.get_version.outputs.version }}" > release/README.md
+        echo "" >> release/README.md
+        echo "This is a Rust-based voice recorder application." >> release/README.md
+        echo "" >> release/README.md
+        echo "## Features:" >> release/README.md
+        echo "- Record audio using microphone" >> release/README.md
+        echo "- Play back recordings" >> release/README.md
+        echo "- Rename and delete recordings" >> release/README.md
+        echo "- Keyboard shortcuts (Space to toggle recording, P to stop playback)" >> release/README.md
+        echo "" >> release/README.md
+        echo "## Usage:" >> release/README.md
+        echo "Simply run rust_voice.exe - no installation required!" >> release/README.md
+        
+        cp target/x86_64-pc-windows-gnu/release/rust_voice.exe release/
+        cd release && zip -r ../rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip . && cd ..
+
+    - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
-        name: rust_voice_windows_zip
-        path: rust_voice_windows.zip
+        name: rust_voice_windows_v${{ steps.get_version.outputs.version }}
+        path: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
 
-    - name: Upload to GitHub Release
-      if: startsWith(github.ref, 'refs/tags/v')
+    - name: Check if tag exists
+      id: check_tag
+      run: |
+        if git rev-parse "${{ steps.get_version.outputs.tag }}" >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create tag and release
+      if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+        git tag ${{ steps.get_version.outputs.tag }}
+        git push origin ${{ steps.get_version.outputs.tag }}
+
+    - name: Create GitHub Release
+      if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
       uses: softprops/action-gh-release@v1
       with:
-        files: rust_voice_windows.zip
+        tag_name: ${{ steps.get_version.outputs.tag }}
+        name: Release ${{ steps.get_version.outputs.tag }}
+        body: |
+          ## Rust Voice Recorder ${{ steps.get_version.outputs.tag }}
+          
+          ### Features:
+          - 🎤 Record audio using your microphone
+          - ▶️ Play back recordings
+          - ✏️ Rename recordings
+          - 🗑️ Delete recordings
+          - ⌨️ Keyboard shortcuts (Space to toggle, P to stop)
+          
+          ### Installation:
+          1. Download the zip file below
+          2. Extract rust_voice.exe
+          3. Run the executable - no installation needed!
+          
+          **Note**: Windows may show a security warning since the executable is not code-signed. This is a false positive - the application is safe to use.
+        files: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
+        draft: false
+        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

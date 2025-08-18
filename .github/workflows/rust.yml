@@ -58,74 +58,13 @@ jobs:
     - name: Create release package
       run: |
         mkdir -p release
-        
-        # Create comprehensive README
-        cat > release/README.md << 'EOF'
-        # 🎤 Rust Voice Recorder v${{ steps.get_version.outputs.version }}
-        
-        A simple, lightweight voice recorder built with Rust.
-        
-        ## ✅ Code Signed Executable
-        
-        This executable is code-signed to reduce Windows security warnings and antivirus false positives. While we use a self-signed certificate (to keep the project free), this still helps with many security software packages.
-        
-        ## ⚠️ Windows Security Note
-        
-        Windows may still show a security warning for self-signed certificates. This is normal and the software is completely safe to use.
-        
-        To run the application:
-        1. Download and extract the zip file
-        2. Run rust_voice.exe
-        3. If Windows shows a warning, click "More info" then "Run anyway"
-        
-        ## ✨ Features
-        
-        - 🎤 Record audio using your microphone
-        - ▶️ Play recordings with high-quality playback
-        - ✏️ Rename recordings with custom names
-        - 🗑️ Delete recordings you no longer need
-        - ⌨️ Keyboard shortcuts:
-          - Spacebar - Start/stop recording
-          - P - Stop playback
-        - 🎯 Lightweight - Small file size, no installation required
-        - 🔒 Privacy-focused - All recordings stay on your computer
-        - ✅ Code-signed executable for better security compatibility
-        
-        ## 🚀 Usage
-        
-        1. Double-click rust_voice.exe to launch
-        2. Click "● Record" or press Spacebar to start recording
-        3. Click "■ Stop" or press Spacebar again to stop
-        4. Your recording appears in the file list
-        5. Use ► to play, Edit to rename, X to delete
-        
-        ## 🛠️ Technical Details
-        
-        - Audio Format: 48kHz WAV files
-        - Built with: Rust, CPAL (audio), Iced (GUI), Hound (WAV)
-        - Requirements: Windows 10/11 (64-bit)
-        - Size: ~5MB executable
-        - Security: Code-signed with SHA-256 timestamping
-        
-        ## 🐛 Troubleshooting
-        
-        No sound during recording?
-        - Check your microphone permissions in Windows Settings
-        - Ensure your microphone is set as the default recording device
-        
-        Can't hear playback?
-        - Check your speaker/headphone volume
-        - Ensure your audio output device is working
-        
-        ---
-        
-        💡 Found a bug or have a suggestion? 
-        Visit our [GitHub repository](https://github.com/ni-ms/rust_voice) to report issues or contribute!
-        EOF
-        
+
+        # Generate README from template with version substitution
+        sed 's/{{VERSION}}/${{ steps.get_version.outputs.version }}/g' templates/readme.template.md > release/README.md
+
         # Copy executable
         cp target/x86_64-pc-windows-gnu/release/rust_voice.exe release/
-        
+
         # Create zip with version in name
         cd release && zip -r ../rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip . && cd ..
     - name: Upload build artifact

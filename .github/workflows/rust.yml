@@ -14,126 +14,96 @@ jobs:
       contents: write    # Required for creating releases and tags
       pull-requests: read
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Fetch full history for versioning
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libasound2-dev mingw-w64 osslsigncode
-    - name: Set up Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        target: x86_64-pc-windows-gnu
-        override: true
-    - name: Build for Windows (Release)
-      run: cargo build --release --target x86_64-pc-windows-gnu --verbose
-    - name: Create self-signed certificate for code signing
-      run: |
-        # Create a self-signed certificate for code signing
-        openssl req -x509 -newkey rsa:4096 -keyout codesign.key -out codesign.crt -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=Rust Voice Recorder"
-        
-        # Convert to PFX format for osslsigncode
-        openssl pkcs12 -export -out codesign.pfx -inkey codesign.key -in codesign.crt -passout pass:
-    - name: Sign Windows executable
-      run: |
-        # Sign the executable
-        osslsigncode sign -certs codesign.crt -key codesign.key \
-          -n "Rust Voice Recorder" \
-          -i "https://github.com/ni-ms/rust_voice" \
-          -t http://timestamp.comodoca.com \
-          -in target/x86_64-pc-windows-gnu/release/rust_voice.exe \
-          -out target/x86_64-pc-windows-gnu/release/rust_voice_signed.exe
-        
-        # Replace the original with signed version
-        mv target/x86_64-pc-windows-gnu/release/rust_voice_signed.exe target/x86_64-pc-windows-gnu/release/rust_voice.exe
-    - name: Get version from Cargo.toml
-      id: get_version
-      run: |
-        VERSION=$(grep '^version = ' Cargo.toml | head -n1 | sed 's/version = "//;s/"//')
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "tag=v$VERSION" >> $GITHUB_OUTPUT
-    - name: Create release package
-      run: |
-        mkdir -p release
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for versioning
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev mingw-w64 osslsigncode
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-gnu
+          override: true
+      - name: Build for Windows (Release)
+        run: cargo build --release --target x86_64-pc-windows-gnu --verbose
+      - name: Create self-signed certificate for code signing
+        run: |
+          # Create a self-signed certificate for code signing
+          openssl req -x509 -newkey rsa:4096 -keyout codesign.key -out codesign.crt -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=Rust Voice Recorder"
+          
+          # Convert to PFX format for osslsigncode
+          openssl pkcs12 -export -out codesign.pfx -inkey codesign.key -in codesign.crt -passout pass:
+      - name: Sign Windows executable
+        run: |
+          # Sign the executable
+          osslsigncode sign -certs codesign.crt -key codesign.key \
+            -n "Rust Voice Recorder" \
+            -i "https://github.com/ni-ms/rust_voice" \
+            -t http://timestamp.comodoca.com \
+            -in target/x86_64-pc-windows-gnu/release/rust_voice.exe \
+            -out target/x86_64-pc-windows-gnu/release/rust_voice_signed.exe
+          
+          # Replace the original with signed version
+          mv target/x86_64-pc-windows-gnu/release/rust_voice_signed.exe target/x86_64-pc-windows-gnu/release/rust_voice.exe
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -n1 | sed 's/version = "//;s/"//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+      - name: Create release package
+        run: |
+          mkdir -p release
+          
+          # Generate README from template with version substitution
+          sed 's/{{VERSION}}/${{ steps.get_version.outputs.version }}/g' templates/readme.template.md > release/README.md
+          
+          # Copy executable
+          cp target/x86_64-pc-windows-gnu/release/rust_voice.exe release/
+          
+          # Create zip with version in name
+          cd release && zip -r ../rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip . && cd ..
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust_voice_windows_v${{ steps.get_version.outputs.version }}
+          path: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git rev-parse "${{ steps.get_version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Create tag
+        if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git tag ${{ steps.get_version.outputs.tag }}
+          git push origin ${{ steps.get_version.outputs.tag }}
 
-        # Generate README from template with version substitution
-        sed 's/{{VERSION}}/${{ steps.get_version.outputs.version }}/g' templates/readme.template.md > release/README.md
+      - name: Generate release notes
+        if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
+        run: |
+          sed "s/{{VERSION}}/${{ steps.get_version.outputs.version }}/g" \
+              templates/release_notes.template.md > release_notes.md
 
-        # Copy executable
-        cp target/x86_64-pc-windows-gnu/release/rust_voice.exe release/
-
-        # Create zip with version in name
-        cd release && zip -r ../rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip . && cd ..
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: rust_voice_windows_v${{ steps.get_version.outputs.version }}
-        path: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
-    - name: Check if tag exists
-      id: check_tag
-      run: |
-        if git rev-parse "${{ steps.get_version.outputs.tag }}" >/dev/null 2>&1; then
-          echo "exists=true" >> $GITHUB_OUTPUT
-        else
-          echo "exists=false" >> $GITHUB_OUTPUT
-        fi
-    - name: Create tag and release
-      if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
-      run: |
-        git config user.name github-actions
-        git config user.email github-actions@github.com
-        git tag ${{ steps.get_version.outputs.tag }}
-        git push origin ${{ steps.get_version.outputs.tag }}
-    - name: Create GitHub Release
-      if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.get_version.outputs.tag }}
-        name: "🎤 Voice Recorder ${{ steps.get_version.outputs.tag }}"
-        body: |
-          ## 🚀 What's New in ${{ steps.get_version.outputs.tag }}
-          
-          A lightweight, privacy-focused voice recorder built with Rust.
-          
-          ### ✨ Features
-          - 🎤 High-quality audio recording (48kHz WAV)
-          - ▶️ Instant playback of recordings  
-          - ✏️ Easy file renaming and management
-          - ⌨️ Convenient keyboard shortcuts
-          - 🔒 Complete privacy - all data stays local
-          - ✅ **Code-signed executable** for better Windows compatibility
-          
-          ### 📥 Installation
-          1. Download the zip file below
-          2. Extract rust_voice.exe anywhere on your computer
-          3. Run the executable - no installation needed!
-          
-          ### ✅ Code Signing Improvements
-          
-          This release includes a **code-signed executable** which should significantly reduce:
-          - Windows security warnings
-          - Antivirus false positives
-          - Download blocks from browsers
-          
-          While we use a self-signed certificate (to keep the project free), this still provides much better compatibility than unsigned executables.
-          
-          ### 🎯 Quick Start
-          - Press Spacebar to start/stop recording
-          - Press P to stop playback  
-          - All recordings saved as WAV files in app folder
-          
-          ### 🐛 Issues or Questions?
-          Report bugs or request features in our [Issues section](https://github.com/ni-ms/rust_voice/issues).
-          
-          ---
-          
-          Download count will show here after release 📊
-        files: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
-        draft: false
-        prerelease: false
-        generate_release_notes: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/master' && steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.tag }}
+          name: "Voice Recorder ${{ steps.get_version.outputs.tag }}"
+          body_path: release_notes.md          # points to the file we just generated
+          files: rust_voice_windows_v${{ steps.get_version.outputs.version }}.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

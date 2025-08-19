@@ -60,6 +60,8 @@ enum Message {
     StartRecording,
     StopRecording,
     PlayFile(String),
+    PausePlayback,
+    ResumePlayback,
     StopPlayback,
     DeleteFile(String),
     StartRename(String),
@@ -72,9 +74,17 @@ enum Message {
     FinalizeRecording,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PlaybackState {
+    Stopped,
+    Playing,
+    Paused,
+}
+
 struct VoiceRecorder {
     is_recording: bool,
-    is_playing: bool,
+    playback_state: PlaybackState,
+    currently_playing_file: Option<String>,
     status_message: String,
     files: Vec<String>,
     audio_data: Arc<Mutex<Vec<f32>>>,
@@ -89,6 +99,10 @@ struct VoiceRecorder {
     recording_channels: u16,
     renaming_file: Option<String>,
     new_name: String,
+    // For pause/resume functionality
+    playback_samples: Arc<Mutex<Vec<f32>>>,
+    playback_position: Arc<Mutex<usize>>,
+    is_stream_paused: Arc<Mutex<bool>>,
 }
 
 impl Default for VoiceRecorder {
@@ -96,7 +110,8 @@ impl Default for VoiceRecorder {
         let (tx, rx) = mpsc::channel();
         Self {
             is_recording: false,
-            is_playing: false,
+            playback_state: PlaybackState::Stopped,
+            currently_playing_file: None,
             status_message: "Ready to record.".into(),
             files: list_wav_files(),
             audio_data: Arc::new(Mutex::new(Vec::new())),
@@ -111,13 +126,16 @@ impl Default for VoiceRecorder {
             recording_channels: 1,
             renaming_file: None,
             new_name: String::new(),
+            playback_samples: Arc::new(Mutex::new(Vec::new())),
+            playback_position: Arc::new(Mutex::new(0)),
+            is_stream_paused: Arc::new(Mutex::new(false)),
         }
     }
 }
 
 impl VoiceRecorder {
     fn start_recording_impl(&mut self) {
-        if self.is_recording {
+        if self.is_recording || self.playback_state != PlaybackState::Stopped {
             return;
         }
 
@@ -284,6 +302,11 @@ impl VoiceRecorder {
     }
 
     fn start_rename_impl(&mut self, filename: &str) {
+        // Can't rename while playing or recording
+        if self.is_recording || self.playback_state != PlaybackState::Stopped {
+            return;
+        }
+
         self.renaming_file = Some(filename.to_string());
         let name_without_ext = filename.strip_suffix(".wav").unwrap_or(filename);
         self.new_name = name_without_ext.to_string();
@@ -327,7 +350,7 @@ impl VoiceRecorder {
     }
 
     fn play_file_impl(&mut self, filename: &str) {
-        if self.is_playing {
+        if self.playback_state != PlaybackState::Stopped || self.is_recording {
             return;
         }
 
@@ -346,6 +369,7 @@ impl VoiceRecorder {
             "File spec: channels={}, sample_rate={}, bits_per_sample={}",
             spec.channels, spec.sample_rate, spec.bits_per_sample
         );
+
         let samples = match spec.sample_format {
             hound::SampleFormat::Float => {
                 match reader
@@ -403,7 +427,14 @@ impl VoiceRecorder {
             return;
         }
 
-        let samples_arc = Arc::new(Mutex::new(samples));
+        // Store samples for pause/resume functionality
+        *self.playback_samples.lock().unwrap() = samples;
+        *self.playback_position.lock().unwrap() = 0;
+        *self.is_stream_paused.lock().unwrap() = false;
+
+        let samples_arc = Arc::clone(&self.playback_samples);
+        let position_arc = Arc::clone(&self.playback_position);
+        let paused_arc = Arc::clone(&self.is_stream_paused);
         let play_tx = self.playback_status_tx.clone();
 
         let host = cpal::default_host();
@@ -505,17 +536,27 @@ impl VoiceRecorder {
         println!("Using sample format: {:?}", sample_format);
 
         let samples_for_callback = Arc::clone(&samples_arc);
+        let position_for_callback = Arc::clone(&position_arc);
+        let paused_for_callback = Arc::clone(&paused_arc);
         let play_tx_clone = play_tx.clone();
 
         let build_out = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
-                    let mut buf = samples_for_callback.lock().unwrap();
-                    let len = out.len().min(buf.len());
+                    let is_paused = *paused_for_callback.lock().unwrap();
+                    if is_paused {
+                        out.fill(0.0);
+                        return;
+                    }
+
+                    let samples = samples_for_callback.lock().unwrap();
+                    let mut position = position_for_callback.lock().unwrap();
+
+                    let len = out.len().min(samples.len() - *position);
                     if len > 0 {
-                        out[..len].copy_from_slice(&buf[..len]);
-                        buf.drain(..len);
+                        out[..len].copy_from_slice(&samples[*position..*position + len]);
+                        *position += len;
 
                         if len < out.len() {
                             out[len..].fill(0.0);
@@ -523,7 +564,8 @@ impl VoiceRecorder {
                     } else {
                         out.fill(0.0);
                     }
-                    if buf.is_empty() {
+
+                    if *position >= samples.len() {
                         let _ = play_tx_clone.send(());
                     }
                 },
@@ -532,23 +574,32 @@ impl VoiceRecorder {
             ),
             SampleFormat::I16 => {
                 let samples_for_callback = Arc::clone(&samples_arc);
+                let position_for_callback = Arc::clone(&position_arc);
+                let paused_for_callback = Arc::clone(&paused_arc);
                 device.build_output_stream(
                     &stream_config,
                     move |out: &mut [i16], _| {
-                        let mut buf = samples_for_callback.lock().unwrap();
-                        let len = out.len().min(buf.len());
+                        let is_paused = *paused_for_callback.lock().unwrap();
+                        if is_paused {
+                            out.fill(0);
+                            return;
+                        }
+
+                        let samples = samples_for_callback.lock().unwrap();
+                        let mut position = position_for_callback.lock().unwrap();
+
+                        let len = out.len().min(samples.len() - *position);
                         for i in 0..len {
-                            out[i] = (buf[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                            out[i] =
+                                (samples[*position + i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         }
                         if len < out.len() {
                             out[len..].fill(0);
                         }
-                        if buf.len() >= len {
-                            buf.drain(..len);
-                        } else {
-                            buf.clear();
-                        }
-                        if buf.is_empty() {
+
+                        *position += len;
+
+                        if *position >= samples.len() {
                             let _ = play_tx_clone.send(());
                         }
                     },
@@ -558,24 +609,34 @@ impl VoiceRecorder {
             }
             SampleFormat::U16 => {
                 let samples_for_callback = Arc::clone(&samples_arc);
+                let position_for_callback = Arc::clone(&position_arc);
+                let paused_for_callback = Arc::clone(&paused_arc);
                 device.build_output_stream(
                     &stream_config,
                     move |out: &mut [u16], _| {
-                        let mut buf = samples_for_callback.lock().unwrap();
-                        let len = out.len().min(buf.len());
+                        let is_paused = *paused_for_callback.lock().unwrap();
+                        if is_paused {
+                            out.fill(u16::MAX / 2);
+                            return;
+                        }
+
+                        let samples = samples_for_callback.lock().unwrap();
+                        let mut position = position_for_callback.lock().unwrap();
+
+                        let len = out.len().min(samples.len() - *position);
                         for i in 0..len {
-                            let v = ((buf[i].clamp(-1.0, 1.0) + 1.0) * 0.5 * u16::MAX as f32);
+                            let v = ((samples[*position + i].clamp(-1.0, 1.0) + 1.0)
+                                * 0.5
+                                * u16::MAX as f32);
                             out[i] = v as u16;
                         }
                         if len < out.len() {
                             out[len..].fill(u16::MAX / 2);
                         }
-                        if buf.len() >= len {
-                            buf.drain(..len);
-                        } else {
-                            buf.clear();
-                        }
-                        if buf.is_empty() {
+
+                        *position += len;
+
+                        if *position >= samples.len() {
                             let _ = play_tx_clone.send(());
                         }
                     },
@@ -585,27 +646,34 @@ impl VoiceRecorder {
             }
             SampleFormat::U8 => {
                 let samples_for_callback = Arc::clone(&samples_arc);
+                let position_for_callback = Arc::clone(&position_arc);
+                let paused_for_callback = Arc::clone(&paused_arc);
                 device.build_output_stream(
                     &stream_config,
                     move |out: &mut [u8], _| {
-                        let mut buf = samples_for_callback.lock().unwrap();
-                        let len = out.len().min(buf.len());
-                        for i in 0..len {
-                            let sample = buf[i].clamp(-1.0, 1.0);
-                            let scaled = (sample + 1.0) * 127.5;
+                        let is_paused = *paused_for_callback.lock().unwrap();
+                        if is_paused {
+                            out.fill(128);
+                            return;
+                        }
 
+                        let samples = samples_for_callback.lock().unwrap();
+                        let mut position = position_for_callback.lock().unwrap();
+
+                        let len = out.len().min(samples.len() - *position);
+                        for i in 0..len {
+                            let sample = samples[*position + i].clamp(-1.0, 1.0);
+                            let scaled = (sample + 1.0) * 127.5;
                             let dithered = scaled + ((i as f32 * 0.618033988749) % 1.0 - 0.5);
                             out[i] = dithered.clamp(0.0, 255.0) as u8;
                         }
                         if len < out.len() {
                             out[len..].fill(128);
                         }
-                        if buf.len() >= len {
-                            buf.drain(..len);
-                        } else {
-                            buf.clear();
-                        }
-                        if buf.is_empty() {
+
+                        *position += len;
+
+                        if *position >= samples.len() {
                             let _ = play_tx_clone.send(());
                         }
                     },
@@ -627,7 +695,8 @@ impl VoiceRecorder {
                     return;
                 }
                 self.output_stream = Some(stream);
-                self.is_playing = true;
+                self.playback_state = PlaybackState::Playing;
+                self.currently_playing_file = Some(filename.to_string());
                 self.status_message = format!("Playing: {}", filename);
                 self.start_time = Some(Instant::now());
                 self.elapsed_time = Duration::from_secs(0);
@@ -638,17 +707,54 @@ impl VoiceRecorder {
         }
     }
 
+    fn pause_playback_impl(&mut self) {
+        if self.playback_state == PlaybackState::Playing {
+            *self.is_stream_paused.lock().unwrap() = true;
+            self.playback_state = PlaybackState::Paused;
+            self.status_message = if let Some(file) = &self.currently_playing_file {
+                format!("Paused: {}", file)
+            } else {
+                "Playback paused.".into()
+            };
+            self.start_time = None;
+        }
+    }
+
+    fn resume_playback_impl(&mut self) {
+        if self.playback_state == PlaybackState::Paused {
+            *self.is_stream_paused.lock().unwrap() = false;
+            self.playback_state = PlaybackState::Playing;
+            self.status_message = if let Some(file) = &self.currently_playing_file {
+                format!("Playing: {}", file)
+            } else {
+                "Playback resumed.".into()
+            };
+            self.start_time = Some(Instant::now());
+        }
+    }
+
     fn stop_playback_impl(&mut self) {
-        if self.is_playing {
+        if self.playback_state != PlaybackState::Stopped {
             self.output_stream = None;
-            self.is_playing = false;
+            self.playback_state = PlaybackState::Stopped;
+            self.currently_playing_file = None;
             self.status_message = "Playback stopped.".into();
             self.start_time = None;
             self.elapsed_time = Duration::from_secs(0);
+            *self.is_stream_paused.lock().unwrap() = false;
+            *self.playback_position.lock().unwrap() = 0;
         }
     }
 
     fn delete_file_impl(&mut self, filename: &str) {
+        // Can't delete while recording, playing, or renaming
+        if self.is_recording
+            || self.playback_state != PlaybackState::Stopped
+            || self.renaming_file.is_some()
+        {
+            return;
+        }
+
         match fs::remove_file(filename) {
             Ok(_) => {
                 self.status_message = format!("Deleted file: {}", filename);
@@ -660,17 +766,39 @@ impl VoiceRecorder {
         }
     }
 
+    fn can_interact_with_file(&self, filename: &str) -> bool {
+        // Can't interact if recording or if this file is currently playing
+        if self.is_recording {
+            return false;
+        }
+
+        if let Some(playing_file) = &self.currently_playing_file {
+            if playing_file == filename && self.playback_state != PlaybackState::Stopped {
+                return false;
+            }
+        }
+
+        // Can't interact if any file is being renamed
+        if self.renaming_file.is_some() {
+            return false;
+        }
+
+        true
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::StartRecording => self.start_recording_impl(),
             Message::StopRecording => self.stop_recording_impl(),
             Message::PlayFile(fname) => self.play_file_impl(&fname),
+            Message::PausePlayback => self.pause_playback_impl(),
+            Message::ResumePlayback => self.resume_playback_impl(),
             Message::StopPlayback => self.stop_playback_impl(),
             Message::DeleteFile(fname) => self.delete_file_impl(&fname),
             Message::StartRename(filename) => self.start_rename_impl(&filename),
             Message::UpdateRenameName(name) => {
                 self.new_name = name;
-            },
+            }
             Message::ConfirmRename => self.confirm_rename_impl(),
             Message::CancelRename => self.cancel_rename_impl(),
             Message::FinalizeRecording => self.finalize_recording(),
@@ -693,6 +821,10 @@ impl VoiceRecorder {
             Message::Toggle => {
                 if self.is_recording {
                     self.stop_recording_impl();
+                } else if self.playback_state == PlaybackState::Playing {
+                    self.pause_playback_impl();
+                } else if self.playback_state == PlaybackState::Paused {
+                    self.resume_playback_impl();
                 } else {
                     self.start_recording_impl();
                 }
@@ -703,7 +835,10 @@ impl VoiceRecorder {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let tick = if self.is_recording || self.is_playing || self.stopping_time.is_some() {
+        let tick = if self.is_recording
+            || self.playback_state != PlaybackState::Stopped
+            || self.stopping_time.is_some()
+        {
             time::every(Duration::from_millis(16)).map(Message::Tick)
         } else {
             Subscription::none()
@@ -725,17 +860,13 @@ impl VoiceRecorder {
 
         let timer_text = text(formatted).size(40);
 
-        let record_button =
-            if !self.is_recording && !self.is_playing && self.stopping_time.is_none() {
-                button(text("● Record")).on_press(Message::StartRecording)
-            } else {
-                button(text("■ Stop")).on_press(Message::StopRecording)
-            };
-
-        let stop_playback_button = if self.is_playing {
-            button(text("■ Stop Playback")).on_press(Message::StopPlayback)
+        // Single record button that shows current state
+        let record_button = if self.is_recording {
+            button(text("Stop Recording")).on_press(Message::StopRecording)
+        } else if self.playback_state == PlaybackState::Stopped && self.stopping_time.is_none() {
+            button(text("Record")).on_press(Message::StartRecording)
         } else {
-            button(text("■ Stop Playback"))
+            button(text("Record")) // Disabled when playing
         };
 
         let files_content = if self.files.is_empty() {
@@ -743,36 +874,71 @@ impl VoiceRecorder {
         } else {
             let mut files_col = column![];
             for file_name in &self.files {
-                let row_content = if let Some(renaming) = &self.renaming_file {
-                    if renaming == file_name {
-                        // Show rename input
-                        row![
-                            text_input("Enter new name...", &self.new_name)
-                                .on_input(Message::UpdateRenameName)
-                                .width(Length::Fill),
-                            button(text("✓")).on_press(Message::ConfirmRename),
-                            button(text("✗")).on_press(Message::CancelRename),
-                        ]
-                            .spacing(8)
-                    } else {
-                        // Show regular file row but disabled
-                        row![
-                            text(file_name).width(Length::Fill),
-                        button(text("►")),
-                        button(text("Edit")),
-                        button(text("X")),
-                        ]
-                            .spacing(8)
-                    }
-                } else {
-                    // Show normal file row with all buttons active
+                let is_currently_playing = self.currently_playing_file.as_ref() == Some(file_name)
+                    && self.playback_state != PlaybackState::Stopped;
+                let can_interact = self.can_interact_with_file(file_name);
+                let is_being_renamed = self.renaming_file.as_ref() == Some(file_name);
+
+                let row_content = if is_being_renamed {
+                    // Show rename input
                     row![
-                        text(file_name).width(Length::Fill),
-                    button(text("►")).on_press(Message::PlayFile(file_name.clone())),
-                    button(text("Edit")).on_press(Message::StartRename(file_name.clone())),
-                    button(text("X")).on_press(Message::DeleteFile(file_name.clone())),
+                        text_input("Enter new name...", &self.new_name)
+                            .on_input(Message::UpdateRenameName)
+                            .width(Length::Fill),
+                        button(text("Save")).on_press(Message::ConfirmRename),
+                        button(text("Cancel")).on_press(Message::CancelRename),
                     ]
-                        .spacing(8)
+                    .spacing(8)
+                } else {
+                    // Show normal file row - one button per file that changes based on state
+                    let primary_button = if is_currently_playing {
+                        match self.playback_state {
+                            PlaybackState::Playing => {
+                                button(text("Pause")).on_press(Message::PausePlayback)
+                            }
+                            PlaybackState::Paused => {
+                                button(text("Resume")).on_press(Message::ResumePlayback)
+                            }
+                            _ => button(text("Play")),
+                        }
+                    } else if can_interact {
+                        button(text("Play")).on_press(Message::PlayFile(file_name.clone()))
+                    } else {
+                        button(text("Play")) // Disabled
+                    };
+
+                    let stop_button = if is_currently_playing {
+                        button(text("Stop")).on_press(Message::StopPlayback)
+                    } else {
+                        button(text("Stop")) // Disabled when not playing
+                    };
+
+                    let edit_button = if can_interact {
+                        button(text("Rename")).on_press(Message::StartRename(file_name.clone()))
+                    } else {
+                        button(text("Rename")) // Disabled
+                    };
+
+                    let delete_button = if can_interact {
+                        button(text("Delete")).on_press(Message::DeleteFile(file_name.clone()))
+                    } else {
+                        button(text("Delete")) // Disabled
+                    };
+
+                    let file_display = if is_currently_playing {
+                        text(format!("[PLAYING] {}", file_name)).width(Length::Fill)
+                    } else {
+                        text(file_name).width(Length::Fill)
+                    };
+
+                    row![
+                        file_display,
+                        primary_button,
+                        stop_button,
+                        edit_button,
+                        delete_button,
+                    ]
+                    .spacing(8)
                 };
                 files_col = files_col.push(row_content);
             }
@@ -785,12 +951,12 @@ impl VoiceRecorder {
             text("Voice Recorder").size(30),
             text(&self.status_message).size(16),
             timer_text,
-            row![record_button, stop_playback_button].spacing(12),
+            record_button,
             text("Recorded Files").size(22),
             files_scroll
         ]
-            .spacing(16)
-            .align_x(iced::Alignment::Center);
+        .spacing(16)
+        .align_x(iced::Alignment::Center);
 
         center(content).into()
     }

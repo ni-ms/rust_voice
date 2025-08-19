@@ -3,7 +3,7 @@ Release v{{VERSION}}
 
 What’s new
 ----------
-- Modified rust.yml
+- Fixed playback
 
 Installation
 ------------
